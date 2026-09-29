@@ -146,9 +146,10 @@ npm install traverse-embedder-web@0.14.0
 ```
 
 Swift, Maven, and NuGet packages are published as of `v0.14.0` (see the
-platform table below); there is no GitHub Release object named `v0.14.0`
-itself — this repo's immutable-releases policy means binary artifacts (like
-the Swift xcframework) ship under their own dedicated release tags instead.
+platform table below). The GitHub Release is
+[**Traverse v0.14.0**](https://github.com/traverse-framework/traverse/releases/tag/v0.14.0);
+binary artifacts (like the Swift xcframework) ship on their own
+`swift-host-v*` artifact releases, never marked Latest.
 See [docs/releases/v0.14.0.md](docs/releases/v0.14.0.md) and the
 [v0.14.0 upgrade guide](docs/upgrade-to-v0.14.0.md) (breaking Spec 138 model-package changes).
 

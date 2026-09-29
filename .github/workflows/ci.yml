@@ -383,6 +383,27 @@ jobs:
           TRAVERSE_PUBLISH_DRY_RUN_BEFORE: "1"
         run: bash scripts/ci/publish_crates.sh
 
+  # Spec 048 FR-016 (#1574): the product GitHub Release "Traverse vX.Y.Z",
+  # marked Latest, created only after crates.io publishing succeeded.
+  # Artifact releases (swift-host-v*, runtime-wasm-v*) are never Latest.
+  github-release:
+    name: Create "Traverse vX.Y.Z" GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Create the product release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci/create_product_release.sh "${GITHUB_REF_NAME}"
+
   pr-hygiene:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
