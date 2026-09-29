@@ -527,7 +527,7 @@
     },
     {
       "id": "048-semver-publishing-pipeline",
-      "version": "1.3.0",
+      "version": "1.4.0",
       "status": "approved",
       "immutable": true,
       "path": "specs/048-semver-publishing-pipeline/spec.md",
@@ -546,7 +546,10 @@
         ".github/workflows/web-embedder-publish.yml",
         "packages/web/TraverseEmbedder/",
         "docs/release-process.md",
-        "docs/web-embedder-npm-publish-runbook.md"
+        "docs/web-embedder-npm-publish-runbook.md",
+        "scripts/ci/create_product_release.sh",
+        "scripts/ci/release_naming_check.sh",
+        ".github/workflows/swift-embedder-publish.yml"
       ]
     },
     {

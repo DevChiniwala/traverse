@@ -17,6 +17,27 @@ Use the release helper from a clean `main` checkout after CI is green:
    from `traverse-framework/registry`.
 7. Verify npm lists `traverse-embedder-web@<version>`
    (`npm view traverse-embedder-web version`).
+8. Verify the GitHub Release **`Traverse v<version>`** exists on tag
+   `v<version>` and is marked **Latest**. CI's `github-release` job creates it
+   from `docs/releases/v<version>.md` after the crates.io publish succeeds.
+
+### GitHub Release naming convention (Spec 048 FR-016–FR-018)
+
+| Release | Tag | Title | Latest |
+|---|---|---|---|
+| Product | `vX.Y.Z` | `Traverse vX.Y.Z` (exactly) | **yes** |
+| Swift artifact | `swift-host-vX.Y.Z[-N]` | `TraverseSwiftHost xcframework (workspace vX.Y.Z…)` | never |
+| runtime.wasm artifact | `runtime-wasm-vX.Y.Z` | `runtime.wasm vX.Y.Z (…)` | never |
+
+- The product release is notes-only, so the immutable-releases policy (which
+  only forbids adding assets after publish) never blocks it. Only
+  `scripts/ci/create_product_release.sh` creates it. The script is idempotent
+  and accepts `--not-latest` for backfills.
+- Every artifact `gh release create` passes `--latest=false` and never uses
+  the `Traverse v…` title.
+- `docs/releases/v<version>.md` must land with the version bump.
+  `scripts/ci/release_naming_check.sh` (run by `repository_checks.sh` on
+  every PR) enforces all three rules.
 
 The version argument is `MAJOR.MINOR.PATCH` without a leading `v`. The helper
 refuses invalid versions, dirty working trees, and pre-existing local release

@@ -4,7 +4,7 @@
 **Created**: 2026-07-03
 **Amended**: 2026-09-14
 **Status**: Approved
-**Version**: 1.3.0
+**Version**: 1.4.0
 **Input**: Cargo.toml workspace version has drifted from the git tag (0.5.0 in Cargo.toml, v0.7.0 tagged). No crates.io publishing is configured. No automated version bump exists. `repository` field still points to old org URL. This spec closes all three gaps.
 
 ## Purpose
@@ -100,6 +100,18 @@ and never depends on a long-lived npm token.
 - **FR-014**: At each Traverse release `X.Y.Z`, the Cargo workspace version and `traverse-embedder-web` npm version MUST be identical. Web is not an independent version line.
 - **FR-015**: On every `v*` release tag, `version-guard` MUST fail when web `package.json` version does not equal the tag version (without the leading `v`).
 
+- **FR-016**: On every product tag `vX.Y.Z`, CI MUST create a notes-only
+  GitHub Release titled exactly `Traverse vX.Y.Z` on that tag, with notes from
+  `docs/releases/vX.Y.Z.md`, marked Latest, only after the crates.io `publish`
+  job succeeds. Creation MUST be idempotent: an existing release with the
+  exact title is success, and any other title on that tag fails.
+- **FR-017**: Artifact GitHub Releases (`swift-host-v*`, `runtime-wasm-v*`, and
+  any future artifact namespace) MUST be created with `--latest=false` and
+  MUST NOT be titled `Traverse v…`.
+- **FR-018**: `docs/releases/v<workspace version>.md` MUST exist whenever the
+  workspace version changes. A repository check MUST enforce FR-016's CI
+  wiring, FR-017, and FR-018 on every PR.
+
 ## Non-Functional Requirements
 
 - **NFR-001**: Publish order MUST respect crate dependency graph — no crate is published before its dependencies.
@@ -119,6 +131,8 @@ and never depends on a long-lived npm token.
 - `packages/web/TraverseEmbedder/package.json` and `package-lock.json` (web release identity and locked dependencies)
 - `packages/web/TraverseEmbedder/.npmrc` (web tag prefix)
 - `docs/release-process.md` and `docs/web-embedder-npm-publish-runbook.md` (release documentation)
+- `scripts/ci/create_product_release.sh` and `scripts/ci/release_naming_check.sh` (GitHub Release naming, FR-016–FR-018)
+- `.github/workflows/swift-embedder-publish.yml` (artifact release `--latest=false`, FR-017)
 
 ## Amendment History
 
@@ -162,3 +176,20 @@ commit and creates both `vX.Y.Z` and `web-vX.Y.Z`. `version-guard` fails a
 `v*` tag whose web `package.json` does not match; the web publish workflow
 fails a `web-v*` tag whose Cargo workspace version does not match. FR-007,
 FR-009, FR-012, and FR-013 amended; FR-014 and FR-015 added.
+
+### 1.4.0 — 2026-09-29
+
+**Owner**: Traverse maintainers (issue #1574). **Rationale**: through v0.12.0
+the product GitHub Release `Traverse vX.Y.Z` was created by hand. Since
+v0.13.0 nothing created it, while the Swift artifact workflow's releases took
+GitHub's default Latest, so `swift-host-v0.14.0` showed as the repo's current
+release (and `swift-host-v0.13.0` had been titled `Traverse v0.13.0`). The
+artifact workflow also wrongly claimed the immutable-releases policy blocks a
+release on the shared tag. It only forbids adding assets after publish, and
+a notes-only release is unaffected.
+
+**Changes**: new FR-016 (CI creates `Traverse vX.Y.Z`, Latest, after
+`publish`, idempotent), FR-017 (artifact releases are never Latest and never
+use the product title), and FR-018 (release notes required for the workspace
+version, with every rule statically enforced on each PR). Additive. The
+tagging interface, crate list, and publish order are unchanged.
