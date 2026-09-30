@@ -2755,6 +2755,7 @@ dependencies = [
  "traverse-contracts",
  "traverse-registry",
  "uuid",
+ "wasmi",
  "wasmtime",
  "wasmtime-wasi",
  "wat",
@@ -2778,6 +2779,7 @@ version = "0.14.0"
 dependencies = [
  "serde_json",
  "sha2 0.11.0",
+ "traverse-runtime",
  "wasmi",
  "wat",
 ]
