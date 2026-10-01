@@ -41,6 +41,21 @@ publication, or a documented reviewed exception for a genuinely new primitive.
 Structural validation can reject unambiguous leakage, but human review decides
 whether the capability is semantically generic.
 
+## Registry model attribution
+
+For a new Registry entry whose `ai.model_backed` value is `true`, include a
+non-empty `ai.models` array of objects. Each model object needs a non-empty
+`id` and `spdx_expression`, a boolean `attribution_required`, and either a
+pinned `huggingface_id` plus `revision` or an absolute HTTPS `source_url`.
+The legacy `string[]` model form remains readable on existing Registry
+contracts, but it is not accepted for a new model-backed entry.
+
+`traverse-cli capability publish` checks this shape during both `--dry-run`
+and publish, before registry Git writes, and preserves the complete `ai`
+object in the generated contract. It does not fetch model sources; Registry CI
+remains authoritative for SPDX expression syntax and final admission
+validation (Registry Spec 001 FR-017 / Decision 124).
+
 ## Minimal Working Template
 
 This is a minimal contract you can copy, edit, and validate locally. It intentionally avoids events and dependencies so you can focus on structure first.
