@@ -1937,7 +1937,10 @@
         "docs/adr/0077-digits-mlp-guest-abi-unsafe-boundary.md",
         "scripts/ci/digits_mlp_guest_check.sh",
         "crates/traverse-swift-host/",
-        "docs/adr/0078-swift-host-model-call-abi.md"
+        "docs/adr/0078-swift-host-model-call-abi.md",
+        "crates/traverse-onnx-runner-guest/",
+        "fixtures/onnx/",
+        "scripts/ci/onnx_runner_guest_check.sh"
       ]
     },
     {
