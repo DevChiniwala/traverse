@@ -3,6 +3,8 @@
 **Feature Branch**: `056-capability-publish`
 **Created**: 2026-07-06
 **Status**: Approved
+**Version**: 1.1.0
+**Amended**: 2026-10-01 (Decision 109 / #1459 / PR #1597): FR-014–FR-019, publish-time registry admission parity.
 **Input**: GitHub issue #543, registry decision log entry 9, registry specs `001-registry-foundation` and `002-capability-validation`, and Traverse specs `051-registry-extraction` and `054-public-scope-registry-ref`.
 
 ## Purpose
@@ -24,6 +26,21 @@ Traverse MUST provide `traverse-cli capability publish` as a governed PR automat
 - **FR-011**: The command MUST support a dry-run mode that performs validation and reports the planned registry path, branch name, and PR title without writing to the registry repo.
 - **FR-012**: The command MUST support JSON output suitable for automation.
 - **FR-013**: The command MUST be idempotent enough for retry: re-running after a network or PR creation failure MUST detect existing prepared state and either reuse it or report the conflict explicitly.
+
+### Registry Admission Parity (v1.1.0, Decision 109)
+
+- **FR-014**: Before any registry write, in both dry-run and real runs, the command MUST check every registry admission rule that can be decided from the candidate contract JSON alone. Each failure MUST be a structured error whose code identifies the rule family and whose message names the governing registry spec and FR. Registry CI remains authoritative (see Out of Scope).
+- **FR-015**: The command MUST NOT evaluate registry rules that need network access or files other than the candidate contract. Examples: fetching evidence-file digests, or cross-checking capability-src manifests in `--registry-repo`. Those rules remain registry-CI-only.
+- **FR-016**: Because every publication adds a new `<namespace>/<id>/<version>` path (FR-006), the command MUST apply the registry's newly-added-contract gates to every candidate. Grandfathered shapes that the registry accepts only on already-published versions MUST be rejected.
+- **FR-017**: The command MUST copy registry-only top-level fields from the author contract into the registry-bound contract verbatim. These include `use_cases`, `evidence` and `ai`. An absent or `null` field MUST be treated the way registry CI treats it; for example, `"ai": null` counts as an absent `ai`.
+- **FR-018**: Applied to model attribution (registry `001` FR-017 and registry `026`), FR-014 means that a candidate with `ai.model_backed: true` MUST supply a non-empty object-shaped `ai.models`, and each entry MUST carry:
+  - every registry FR-017 field;
+  - an immutable upstream pin: `revision` is a 40- or 64-hex commit id, or `source_url` contains one;
+  - a syntactically valid `spdx_expression`;
+  - the parts of the registry `026` rights record that the contract alone decides: the rights enums (`unknown` rejected), the hard contradictions, `verification.status`, the shape of `license_files` / `notice_files` entries, the presence of the `derivation` key, and the shape of `data_obligations`.
+
+  The command MUST NOT fetch model sources.
+- **FR-019**: Parity with registry CI MUST be proven against a versioned accept/reject fixture corpus that the registry owns. Traverse MUST vendor a pinned copy. A CLI test MUST agree with the expected outcome of every fixture tagged `contract_decidable`, and MUST list every fixture tagged `ci_only` as skipped. Bumping the pin is the only way the local rule set changes.
 
 ## Command Shape
 
@@ -54,6 +71,9 @@ Successful JSON output after PR creation MUST include at least:
 3. **Given** local validation fails, **When** publish runs, **Then** no registry branch or PR is created.
 4. **Given** the target registry path already exists, **When** publish runs, **Then** it fails with an immutable-version conflict before modifying the registry checkout.
 5. **Given** PR creation fails after a branch is prepared, **When** the command exits, **Then** JSON output reports the branch and files that remain for retry or cleanup.
+6. **Given** a contract with `ai.model_backed: true` whose model pins `revision: "main"`, or omits the registry `026` rights record, **When** `capability publish --dry-run` runs, **Then** it fails with a model-attribution error naming the registry FR, and does not write to the registry.
+7. **Given** a contract with `"ai": null`, **When** publish runs, **Then** it is treated as having no `ai` object.
+8. **Given** the pinned registry admission corpus, **When** the CLI test suite runs, **Then** the outcome of every `contract_decidable` fixture matches the outcome the registry expects.
 
 ## Out of Scope
 

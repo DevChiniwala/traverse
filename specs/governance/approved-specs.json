@@ -637,7 +637,7 @@
     },
     {
       "id": "056-capability-publish",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "status": "approved",
       "immutable": true,
       "path": "specs/056-capability-publish/spec.md",
@@ -645,7 +645,9 @@
         "crates/traverse-cli/",
         "contracts/",
         "specs/056-capability-publish/",
-        "specs/governance/"
+        "specs/governance/",
+        "docs/capability-contract-authoring-guide.md",
+        "docs/decision-log.md"
       ]
     },
     {

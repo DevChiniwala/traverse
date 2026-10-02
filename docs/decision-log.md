@@ -6034,3 +6034,139 @@ Three facts shaped the design:
 
 Approved by Enrico in `/brainstorm` (2026-10-01): every recommended option
 accepted.
+
+## Decision 109: Publish-Time Registry Admission Parity — Contract-Decidable Rules Checked Locally, Proven by a Registry-Owned Fixture Corpus
+
+- **Date**: 2026-10-01
+- **Status**: Accepted
+- **Governing specs**: `056-capability-publish` (amended to `1.1.0` in the
+  implementation PR); registry `001-registry-foundation` FR-017 (registry
+  Decision 124) and registry `026-model-rights-compliance` (registry
+  Decision 127) supply the rules being mirrored
+- **Related issues**: `#1459`; PR `#1597` (external contribution, extended
+  in place); a new registry ticket for the admission fixture corpus
+- **Origin**: `/brainstorm` after a full review of `#1597`
+
+### Context
+
+`#1597` makes `capability publish` validate `ai.model_backed` /
+`ai.models` before any registry write, and keep the `ai` object in the
+registry-bound contract. Before this PR, publish dropped `ai` silently, so
+every model-backed capability looked like a plain one to the registry. The
+direction fits Spec 056:
+- FR-001 says publish validates locally before any PR;
+- registry CI stays authoritative ("replacing registry CI" is out of
+  scope).
+
+The review found that the local check is weaker than registry CI:
+- It accepts a moving `revision` (`main`), and a `source_url` with no commit
+  id. Registry FR-017 and Spec 026 FR-008 both reject these.
+- It ignores the Spec 026 rights record that registry CI requires on every
+  newly added model-backed `ModelRef`:
+  - `commercial_use`, `redistribution` and `derivatives`;
+  - `verification`;
+  - `license_files` and `notice_files`;
+  - the `derivation` key.
+- It rejects `"ai": null`, which registry CI treats as absent.
+- It leaves SPDX syntax to CI.
+
+So dry-run reports success for contracts the registry rejects, which is the
+late failure `#1459` exists to prevent. The rules already drifted once:
+Spec 026 landed in the registry after `#1459` was written.
+
+### Decision
+
+These are project-wide rules for `capability publish`. They apply to every
+registry-only field it carries, not just model attribution.
+
+1. **Check every registry admission rule that the contract alone decides.**
+   Before any registry write, in dry-run and in real runs, publish checks
+   every registry admission rule it can decide from the candidate contract
+   JSON alone. Each failure is a structured error naming the registry spec
+   and FR. Registry CI stays authoritative.
+2. **Rules that need other files or the network stay CI-only.** Examples:
+   - `derivation.converted_sha256` against the capability-src
+     `model-weights.json`;
+   - fetching `license_files` / `notice_files` digests.
+
+   The CLI does not read them from `--registry-repo` and never fetches
+   anything.
+3. **Every publish counts as newly added.** Publish always writes a new
+   `<namespace>/<id>/<version>` path (FR-006 refuses to overwrite), so the
+   strict new-contract gates always apply. In particular, `model_backed:
+   true` requires the object-shaped `ModelRef[]`. Legacy `string[]` models
+   are accepted only when `model_backed` is `false`.
+4. **For model attribution this means:**
+   - Every registry FR-017 field.
+   - An immutable upstream pin: `revision` is a 40- or 64-hex commit id, or
+     `source_url` contains one.
+   - SPDX syntax.
+   - The contract-decidable parts of the Spec 026 rights record:
+     - the rights enums (`unknown` is rejected);
+     - the hard contradictions;
+     - `verification.status`;
+     - the shape of the `license_files` / `notice_files` entries;
+     - the presence of the `derivation` key;
+     - the `data_obligations` shape.
+5. **Registry-only fields are kept verbatim.** Absent and `null` mean what
+   the registry says they mean (`"ai": null` counts as absent).
+6. **Parity is proven by a fixture corpus that the registry owns.**
+   - The registry publishes a versioned set of accept/reject contract
+     fixtures with expected error codes.
+   - Each fixture is tagged either `contract_decidable` or `ci_only`.
+   - A registry test proves `capability_validation.py` agrees with every
+     fixture.
+   - Traverse vendors a pinned copy (the same pattern as `scripts/ci`).
+   - A CLI test must agree with every `contract_decidable` fixture.
+   - The registry corpus lands first; the Traverse change follows and pins
+     it.
+7. **SPDX is checked with the Rust `spdx` crate in strict mode.** The corpus
+   includes valid and invalid expressions, so any disagreement with CI's
+   pinned `license-expression` shows up as a failing fixture rather than as
+   silent drift.
+8. **Landing.**
+   - The work is added to `#1597` itself: maintainer edits are enabled, and
+     the contributor's commit and credit are kept.
+   - It includes the Spec 056 `1.1.0` amendment and the docs and help
+     updates.
+   - Merge waits on the registry corpus and on CI and CLA being green.
+
+### Alternatives Considered
+
+- Scope of the local check:
+  - FR-017 plus the pin check, with Spec 026 as a follow-up. Rejected: dry-run
+    would keep passing contracts the registry rejects.
+  - Merge as-is. Rejected: the docs say "pinned" while the code accepts
+    `main`, and the `ai: null` regression would ship.
+- Drift guard:
+  - Move the rules into the `traverse-registry` crate and rewrite registry
+    CI in Rust. Rejected: far larger, and it rewrites a working validator.
+  - Mirror the rules by hand. Rejected: that is how the Spec 026 drift
+    happened.
+- Spec home:
+  - A new dedicated spec. Rejected: it splits publish governance across two
+    documents for a few FRs.
+  - A decision-log entry only. Rejected: there would be no FR for the
+    spec-alignment gate to bind to.
+- PR path:
+  - Ask the external contributor for the full scope. Rejected: it is too
+    heavy an ask, and the corpus does not exist yet.
+  - Supersede the PR with a new one. Rejected: it would close the
+    contributor's PR unmerged.
+- Corpus order:
+  - Write the fixtures in Traverse first. Rejected: Traverse would briefly
+    own registry rules.
+  - Ship the CLI rules first and add the corpus later. Rejected: no drift
+    guard at launch.
+- Cross-file rules: read `model-weights.json` from `--registry-repo`.
+  Rejected: the result would depend on how fresh the checkout is, and the
+  manifest is often added in the same registry PR.
+- SPDX: check non-empty only. Rejected: a mistyped license ID would pass
+  dry-run.
+
+### Approval
+
+Approved by Enrico in `/brainstorm` (2026-10-01). Every recommended option
+was accepted, except the PR path: Enrico chose to have the fix and the
+missing Spec 026 scope implemented on `#1597`, instead of requesting
+changes from the contributor.
