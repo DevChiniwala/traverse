@@ -41,6 +41,48 @@ publication, or a documented reviewed exception for a genuinely new primitive.
 Structural validation can reject unambiguous leakage, but human review decides
 whether the capability is semantically generic.
 
+## Registry model attribution
+
+A contract may carry an `ai` object (registry Spec 001 FR-017). A plain
+deterministic capability omits it, sets it to `null`, or sets
+`ai.model_backed` to `false`. Legacy `string[]` `ai.models` are accepted only
+in that last case.
+
+For a new registry entry with `ai.model_backed: true`, `ai.models` must be a
+non-empty array of objects. Each object needs:
+
+- `id`, a valid SPDX `spdx_expression`, and a boolean `attribution_required`;
+- an immutable pin: `huggingface_id` plus a full 40- or 64-hex commit
+  `revision`, or a `source_url` that contains such a commit id (branches and
+  tags are rejected);
+- the registry Spec 026 rights record:
+  - `commercial_use`, `redistribution` and `derivatives`, each `allowed`,
+    `forbidden` or `conditional` (never `unknown`);
+  - `verification: {status: "maintainer-declared"}`;
+  - `license_files`, plus `notice_files` when `attribution_required` is
+    `true`, as `{url, sha256}` registry release assets;
+  - a `derivation` key: `null` for verbatim weights, otherwise
+    `{transformations, description, converted_sha256}`.
+
+`docs/model-rights.md` in the registry has the full table, including the
+contradiction rules and `data_obligations`.
+
+`traverse-cli capability publish` checks every one of these rules that can be
+decided from the contract alone. It does so during both `--dry-run` and
+publish, before any registry Git write, and reports each failure with the
+registry CI error code. It keeps the `ai` object verbatim in the generated
+contract. Two rules need the network or other files: downloading evidence
+files to verify their digests, and matching `converted_sha256` against
+`model-weights.json`. Those stay with registry CI, and the CLI fetches
+nothing.
+
+SPDX ids resolve against the registry's exported `license-expression`
+symbol table, so licence and exception names match registry CI exactly.
+
+The CLI's rules are proven against the registry-owned fixture corpus vendored
+in `crates/traverse-cli/registry-admission/` (Spec 056 v1.1.0
+FR-019, Decision 109).
+
 ## Minimal Working Template
 
 This is a minimal contract you can copy, edit, and validate locally. It intentionally avoids events and dependencies so you can focus on structure first.
