@@ -9,6 +9,8 @@ mod capability_packages;
 mod federation_operator;
 mod grpc_event_transport;
 mod http_api;
+mod model_cli;
+mod model_packaging;
 #[cfg(test)]
 mod registry_resolution_diagnostics;
 mod supply_chain;
@@ -165,6 +167,13 @@ enum Command {
     },
     ArtifactVerify {
         artifact_path: PathBuf,
+    },
+    Model(model_cli::ModelCommand),
+    ModelPackageOnnx {
+        runner_path: PathBuf,
+        onnx_path: PathBuf,
+        spec_path: PathBuf,
+        out_dir: PathBuf,
     },
     ArtifactSign {
         artifact_path: PathBuf,
@@ -444,7 +453,14 @@ fn run_command(command: Command) -> Result<String, CliError> {
         } => execute_capability_package(&manifest_path, &request_path),
         Command::WasmAbiVerify { wasm_paths } => verify_wasm_abi_imports(&wasm_paths),
         Command::ArtifactVerify { artifact_path } => verify_supply_chain_artifact(&artifact_path),
+        Command::Model(command) => model_cli::run(&command),
         Command::ArtifactSign { artifact_path } => sign_supply_chain_artifact(&artifact_path),
+        Command::ModelPackageOnnx {
+            runner_path,
+            onnx_path,
+            spec_path,
+            out_dir,
+        } => package_onnx_model(&runner_path, &onnx_path, &spec_path, &out_dir),
         Command::FederationPeers { manifest_path } => {
             render_federation_peers(&manifest_path).map_err(CliError::IoError)
         }
@@ -1191,6 +1207,8 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         }
         (Some("artifact"), Some("verify")) => parse_artifact_verify_command(args),
         (Some("artifact"), Some("sign")) => parse_artifact_sign_command(args),
+        (Some("model"), Some("package-onnx")) => parse_model_package_onnx_command(args),
+        (Some("model"), _) => model_cli::parse(args).map(Command::Model),
         (Some("wasm"), Some("abi")) => parse_wasm_abi_command(args),
         (Some("expedition"), Some("execute")) => parse_expedition_execute_command(args),
         (Some("capability"), Some("discover")) => parse_capability_discover_command(args),
@@ -1205,6 +1223,8 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
 
 fn subcommand_help(family: Option<&str>, subcommand: Option<&str>) -> String {
     match (family, subcommand) {
+        (Some("model"), Some("package-onnx")) => help_model_package_onnx(),
+        (Some("model"), subcommand) => model_cli::help(subcommand),
         (Some("bundle"), Some("inspect")) => help_bundle_inspect(),
         (Some("bundle"), Some("register")) => help_bundle_register(),
         (Some("bundle"), _) => help_bundle(),
@@ -1744,6 +1764,33 @@ fn help_artifact() -> String {
     sign <artifact-path>                 Sign an artifact and write its manifest sidecar.
 
   Run `traverse-cli artifact verify --help` or `traverse-cli artifact sign --help` for subcommand-specific help."
+        .to_string()
+}
+
+fn help_model_package_onnx() -> String {
+    "traverse-cli model package-onnx <runner.wasm> <model.onnx> <package.json> <out-dir>
+
+  Purpose:
+    Package one ONNX model as a Spec 138 guest ABI v2 model by patching a
+    copy of the audited ONNX runner guest: the model blob is appended as one
+    data segment and the runner's code is copied byte for byte. Writes
+    <out-dir>/model.wasm and an unsigned <out-dir>/model.manifest.json
+    (schema 2.1.0; the source ONNX SHA-256 and the package.json `source`
+    rights are recorded in rights.derivation), then prints a JSON report.
+    Sign the manifest separately (traverse-cli model sign).
+
+  Required arguments:
+    <runner.wasm>    The pristine runner (fixtures/onnx/runner.wasm).
+    <model.onnx>     ONNX model with exactly one input and one output tensor.
+    <package.json>   Manifest fields (model_id, version, rights, limits, ...)
+                     plus `tensor`: input/output names, shapes, and dtypes.
+    <out-dir>        Directory that receives the package files.
+
+  Optional flags:
+    --help           Print this help text.
+
+  Example:
+    traverse-cli model package-onnx fixtures/onnx/runner.wasm fixtures/onnx/digits-mlp-1.0.0.onnx fixtures/onnx/digits-onnx.package.json out/digits-onnx"
         .to_string()
 }
 
@@ -2541,6 +2588,18 @@ fn parse_artifact_sign_command(args: &[String]) -> Result<Command, String> {
     match args {
         [_, _, _, artifact_path] => Ok(Command::ArtifactSign {
             artifact_path: PathBuf::from(artifact_path),
+        }),
+        _ => Err(usage()),
+    }
+}
+
+fn parse_model_package_onnx_command(args: &[String]) -> Result<Command, String> {
+    match args {
+        [_, _, _, runner_path, onnx_path, spec_path, out_dir] => Ok(Command::ModelPackageOnnx {
+            runner_path: PathBuf::from(runner_path),
+            onnx_path: PathBuf::from(onnx_path),
+            spec_path: PathBuf::from(spec_path),
+            out_dir: PathBuf::from(out_dir),
         }),
         _ => Err(usage()),
     }
@@ -6660,6 +6719,18 @@ fn verify_supply_chain_artifact(artifact_path: &Path) -> Result<String, CliError
     } else {
         Err(CliError::ValidationFailed(json))
     }
+}
+
+fn package_onnx_model(
+    runner_path: &Path,
+    onnx_path: &Path,
+    spec_path: &Path,
+    out_dir: &Path,
+) -> Result<String, CliError> {
+    let report = model_packaging::package_onnx(runner_path, onnx_path, spec_path, out_dir)
+        .map_err(CliError::IoError)?;
+    serde_json::to_string_pretty(&report)
+        .map_err(|e| CliError::IoError(format!("failed to serialize packaging report: {e}")))
 }
 
 fn sign_supply_chain_artifact(artifact_path: &Path) -> Result<String, CliError> {
@@ -12307,6 +12378,55 @@ mod tests {
     }
 
     #[test]
+    fn parse_command_routes_model_package_onnx_and_its_help() {
+        let args = |rest: &[&str]| -> Vec<String> {
+            ["traverse-cli", "model"]
+                .iter()
+                .chain(rest)
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert!(matches!(
+            parse_command(&args(&["package-onnx", "r.wasm", "m.onnx", "p.json", "out"])),
+            Ok(Command::ModelPackageOnnx { runner_path, onnx_path, spec_path, out_dir })
+                if runner_path == Path::new("r.wasm")
+                    && onnx_path == Path::new("m.onnx")
+                    && spec_path == Path::new("p.json")
+                    && out_dir == Path::new("out")
+        ));
+        assert_eq!(
+            parse_command(&args(&["package-onnx", "r.wasm"])).err(),
+            Some(super::usage())
+        );
+        let help = parse_command(&args(&["package-onnx", "--help"])).expect_err("help");
+        assert!(help.contains("<package.json>") && help.contains("Example:"));
+        let group = parse_command(&args(&["--help"])).expect_err("help");
+        assert!(group.contains("package-onnx"));
+    }
+
+    #[test]
+    fn run_command_packages_an_onnx_model_or_fails_cleanly() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let out = unique_temp_dir();
+        let command = |runner: &str| Command::ModelPackageOnnx {
+            runner_path: root.join(runner),
+            onnx_path: root.join("fixtures/onnx/digits-mlp-1.0.0.onnx"),
+            spec_path: root.join("fixtures/onnx/digits-onnx.package.json"),
+            out_dir: out.clone(),
+        };
+        let report: Value = serde_json::from_str(
+            &run_command(command("fixtures/onnx/runner.wasm")).expect("package"),
+        )
+        .expect("report json");
+        assert_eq!(report["model_id"], "traverse.digits-onnx");
+        assert!(matches!(
+            run_command(command("fixtures/onnx/missing.wasm")),
+            Err(CliError::IoError(message)) if message.contains("failed to read")
+        ));
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn parse_command_returns_artifact_sign_help_on_help_flag() {
         let args = vec![
             "traverse-cli".to_string(),
@@ -14312,6 +14432,12 @@ mod tests {
             ("capability-package", None),
             ("artifact", Some("verify")),
             ("artifact", None),
+            ("model", Some("digest")),
+            ("model", Some("sign")),
+            ("model", Some("verify")),
+            ("model", Some("pin")),
+            ("model", Some("conformance")),
+            ("model", None),
             ("wasm", Some("abi")),
             ("wasm", None),
             ("workflow", Some("register")),

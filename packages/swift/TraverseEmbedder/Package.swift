@@ -9,8 +9,8 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "TraverseSwiftHost",
-            url: "https://github.com/traverse-framework/traverse/releases/download/swift-host-v0.14.0-1/TraverseSwiftHost.xcframework.zip",
-            checksum: "22a33b4084a363edca4ce16ad05a7b04d75cc564d85e99328c0c74618175ef56"
+            url: "https://github.com/traverse-framework/traverse/releases/download/swift-host-v0.14.0-3/TraverseSwiftHost.xcframework.zip",
+            checksum: "2007d783b143707c1120090ef8fada70ee21f72c4e7c44751f263e88160d741f"
         ),
         .target(
             name: "TraverseEmbedder",

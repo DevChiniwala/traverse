@@ -4,7 +4,7 @@
 **Created**: 2026-09-16
 **Status**: Approved (2026-09-16)
 **Canonical governing ID**: `138-governed-exact-model-execution`
-**Version**: 0.7.0
+**Version**: 0.9.0
 **Extends**: `137-host-connector-command-dispatch`,
 `044-application-bundle-manifest`, `526-embedded-verified-cache-lifecycle`,
 `1259-portable-authority-contracts`, and Registry signed-artifact verification.
@@ -47,6 +47,29 @@ Adds `wasmi` as a supported `wasm-cpu` engine for JIT-forbidden targets
 obtain input and output buffers from the guest's `model_alloc(len) -> ptr`
 instead of fixed offsets, so guests with a real heap (for example an ONNX
 runner) are safe. v1 is unchanged (FR-032 through FR-034).
+**Amendment (2026-10-01, version 0.7.0 -> 0.8.0, approved 2026-10-01)**: Decision 107 /
+`#1599`. Adds consumer-side model-rights enforcement:
+- an app-declared `model_usage` checked against a fixed table, which the
+  host may only tighten;
+- a structured rights-denial `detail`;
+- a host-owned package status map (`deprecated` / `revoked`), re-checked at
+  every execute;
+- an optional `rights.derivation` in manifest schema `2.1.0`;
+- a rights record in execution evidence;
+- a shared rights conformance suite.
+
+New reasons: `usage_undeclared`, `rights_policy_denied`, `package_revoked`
+and `rights_inconsistent` (FR-035 through FR-042). Breaking for apps:
+`model_usage` is required when model pins exist.
+**Amendment (2026-10-01, version 0.8.0 -> 0.9.0, approved 2026-10-01)**: Decision 105 /
+`#1589`. Adds **two-tier provenance**: FR-024 through FR-027 apply only to
+Traverse-published trained packages. Third-party packages MUST instead pass
+`traverse-cli model verify` and ship a conformance vector that passes
+`model conformance check` on `wasmi` and at least one other engine. The
+`traverse-cli model` packaging commands are now governed. Packages built
+from a source artifact record it in `rights.derivation` (Decision 107
+supersedes Decision 105's free-text `rights.attribution` note). FR-043
+through FR-045. Additive; no ABI or schema change.
 
 **Decision evidence**: Decision 91; Decision 92; ADR-0074 (Accepted).
 **Input**: Callweave portable governed model-execution slice request
@@ -121,6 +144,28 @@ Each `exact_model_dependencies` entry MUST include at least:
 Unknown pin fields fail closed. More than one pin with the same `model_id`
 and `version` is ambiguous and fails closed.
 
+### Model usage (0.8.0, Decision 107)
+
+An application that declares any `exact_model_dependencies` MUST also declare
+`model_usage`: `commercial` or `non_commercial`. A missing value fails closed
+with `model_incompatible` / `usage_undeclared`. The host MAY require
+commercial usage. It can never relax a `commercial` app to `non_commercial`.
+The **effective usage** is `commercial` when either the app or the host says
+so, and otherwise `non_commercial`.
+
+Every host applies the same fixed table to the signed `rights.commercial_use`.
+It runs after the exact pin match, so the pin has already acknowledged the
+package's terms.
+
+| signed `commercial_use` | effective `commercial` | effective `non_commercial` |
+|---|---|---|
+| `allowed` | accept | accept |
+| `restricted` | accept only if the pin declares `restricted` | accept only if the pin declares `restricted` |
+| `prohibited` | deny | accept |
+
+A denial is `model_incompatible` / `rights_policy_denied`. There is no host
+license allowlist and no SPDX compatibility evaluation.
+
 `model.execute.model_ref` MUST equal a declared pin or fail closed
 (`model_unavailable` / `model_incompatible` as appropriate).
 
@@ -140,12 +185,20 @@ least:
 - supported target profiles (at least `wasm-cpu` for conformance);
 - maximum linear memory, fuel/instruction, input bytes, output bytes, and
   execution time;
+- optional `rights.derivation` (schema `2.1.0` only, 0.8.0): `kind`
+  (`converted` | `quantized` | `fine_tuned`), `source_digest` (SHA-256 of
+  the source artifact), `source_license_id`, `source_commercial_use`, and
+  `source_url`. When present, every field is required and non-empty. The
+  package `commercial_use` MUST NOT be more permissive than
+  `source_commercial_use`, using the order `prohibited < restricted <
+  allowed`; a violation is `rights_inconsistent`;
 - optional quantization / numeric precision metadata;
 - provenance / source revision and build reproducibility evidence;
 - whether offline execution is allowed after provisioning.
 
 Validation MUST reject missing rights, digest, ABI, schema refs, or
-resource limits, and any `schema_version` other than `2.0.0`. A model URL
+resource limits, and any `schema_version` other than `2.0.0` or `2.1.0`
+(0.8.0). `rights.derivation` in a `2.0.0` manifest is `manifest_invalid`. A model URL
 alone (including `rights.source_url`) is never an acceptable identity.
 Unknown fields fail closed.
 
@@ -181,7 +234,52 @@ Failures keep the public codes `model_unavailable` / `model_incompatible`
 and add a stable `reason`: `pin_mismatch`, `pin_ambiguous`,
 `signature_invalid`, `key_untrusted`, `digest_mismatch`, `manifest_invalid`,
 `rights_incomplete`, `rights_mismatch`, `target_unsupported`,
-`crypto_unavailable`, `candidate_unsupported`, `host_limit_exceeded` (0.6.0).
+`crypto_unavailable`, `candidate_unsupported`, `host_limit_exceeded` (0.6.0),
+`usage_undeclared`, `rights_policy_denied`, `rights_inconsistent` (all
+`model_incompatible`), and `package_revoked` (`model_unavailable`) (0.8.0).
+
+### Rights denial detail (0.8.0, Decision 107)
+
+These failures MUST carry a `detail` object: `rights_incomplete`,
+`rights_mismatch`, `rights_policy_denied`, `rights_inconsistent`,
+`package_revoked` and `usage_undeclared`. The object has:
+- `model_id`, `version` and `digest` (omitted only when no package is known
+  yet);
+- `field`: the dotted path that failed, for example
+  `rights.commercial_use`;
+- `expected` and `actual`: strings;
+- `effective_usage` (when it was decided).
+
+The shape is identical in every host, so a UI can explain a denial without
+re-deriving policy.
+
+### Package status (0.8.0, Decision 107)
+
+The host owns a package status map from package digest to
+`{status: deprecated | revoked, reason}`. A package absent from the map is
+`active`. Traverse does not distribute the map, and no check uses the
+network. The host MAY replace the map at any time.
+
+The status is checked at registration and on every `model.execute`, which
+is a map lookup with no cryptography:
+- A `revoked` package fails with `model_unavailable` / `package_revoked`.
+  A revocation therefore blocks the very next execute.
+- A `deprecated` package runs normally. Its status and reason appear in the
+  rights record and in the execution evidence.
+
+### Rights record and execution evidence (0.8.0, Decision 107)
+
+A host exposes a **rights record** per registered package, and every
+successful `model.execute` result carries the same record as
+`model_evidence`. The record contains:
+- `model_id`, `version` and `digest`;
+- the full signed `rights` (including `derivation`);
+- `status` (`active` | `deprecated`, plus `revoked` on a host query; a
+  revoked package never executes, so evidence is never `revoked`);
+- `status_reason` (when deprecated);
+- `effective_usage`.
+
+Tensor bytes and secrets stay redacted (FR-011).
 
 ### Browser embedder boundary
 
@@ -285,7 +383,8 @@ Success/failure on the Spec 137 result path MUST surface:
   inline tensor bytes on the command result);
 - exact model identity and digest;
 - placement (`wasm-cpu` initially);
-- trace ID and redacted evidence;
+- trace ID and redacted evidence, including the rights record
+  (`model_evidence`, 0.8.0);
 - measured resource usage;
 - stable reason code, safe diagnostic message, and retryable flag on failure.
 
@@ -318,6 +417,23 @@ The first such package is `fixtures/models/digits-mlp-1.0.0`: a
 64 → 32 (ReLU) → 10 MLP trained on UCI Optical Recognition of Handwritten
 Digits (CC BY 4.0) with a ≥ 95% held-out accuracy floor (96.10% measured).
 It is signed with the test-only key; production signing is `#1567`.
+
+### Third-party packages (0.9.0, Decision 105)
+
+A package that is not a Traverse-published trained model (for example a
+converted pretrained model, or any team's own guest) does not need
+in-repo training provenance. It MUST instead:
+
+- pass `traverse-cli model verify`. That command runs the same registration
+  checks every host runs (signature by a trusted key, manifest and rights
+  including `rights.derivation`, WASM digest, target, host ceilings) and
+  additionally requires zero WASM imports;
+- ship a conformance vector (`traverse-cli model conformance generate`)
+  whose cases produce byte-identical output on `wasmi` and at least one
+  other engine (`wasmtime`), checked by `model conformance check`;
+- record any source artifact it was built from in `rights.derivation`.
+
+The packaging workflow is documented in `docs/model-packaging-guide.md`.
 
 ## Resolver and cache behavior
 
@@ -384,7 +500,7 @@ Traverse MUST:
 - **FR-023**: The browser embedder MUST use WebCrypto Ed25519 and fail closed
   with `crypto_unavailable` when absent, and MUST accept only single exact-ref
   `wasm-cpu` pins (`candidate_unsupported` otherwise).
-- **FR-024**: A trained model package MUST vendor its licensed training and
+- **FR-024**: A Traverse-published trained model package MUST vendor its licensed training and
   held-out data pinned by SHA-256, and MUST NOT download data during training
   or CI.
 - **FR-025**: A trained package's weights MUST come from a deterministic,
@@ -429,6 +545,48 @@ Traverse MUST:
   MUST fail closed with `input_limit_exceeded` when the artifact exceeds the
   lesser of its originally staged ceiling and the consuming capability's
   declared input limit, without invoking the capability (Decision 99).
+- **FR-035**: An app with model pins MUST declare `model_usage`; hosts MUST
+  fail closed with `usage_undeclared` when it is missing, and MUST let the
+  host tighten but never relax it.
+- **FR-036**: Hosts MUST apply the fixed usage table at registration and on
+  every execute, denying with `rights_policy_denied`.
+- **FR-037**: The rights failures listed under "Rights denial detail" MUST
+  carry the structured `detail`.
+- **FR-038**: Hosts MUST accept a host-owned, replaceable package status map
+  and check it at registration and on every execute; `revoked` fails with
+  `package_revoked`, and `deprecated` runs but is flagged.
+- **FR-039**: Hosts MUST accept manifest schemas `2.0.0` and `2.1.0`,
+  validate `rights.derivation`, and reject a derivative more permissive than
+  its source with `rights_inconsistent`.
+- **FR-040**: Every successful `model.execute` MUST carry the rights record as
+  `model_evidence`; hosts MUST expose the same record for a registered
+  package.
+- **FR-041**: A shared, data-only rights conformance suite
+  (`fixtures/models/rights-conformance/`) MUST cover:
+  - permissive, non-commercial and restricted packages;
+  - missing rights and an unknown `commercial_use`;
+  - signature and digest mismatch;
+  - revoked and deprecated packages;
+  - offline cache-only activation;
+  - derivation;
+  - evidence.
+
+  Every model-capable embedder MUST pass it with identical codes, reasons,
+  details and evidence.
+- **FR-042**: Rights enforcement MUST NOT encode application-, model-,
+  species-, location- or UI-specific policy.
+- **FR-043**: FR-024 through FR-027 apply only to Traverse-published trained
+  packages. A third-party package MUST pass `traverse-cli model verify` and
+  ship a conformance vector that passes on `wasmi` and at least one other
+  engine.
+- **FR-044**: `traverse-cli model verify` MUST apply the runtime's own
+  registration rules (it MUST NOT re-implement them) plus a zero-import
+  check, and MUST exit non-zero with the stable `code` / `reason` /
+  `detail` on failure. `traverse-cli model sign` MUST NOT generate or write
+  signing keys.
+- **FR-045**: `traverse-cli model conformance` MUST run every case through
+  the signed register → execute path on `wasmtime` and `wasmi`, and MUST
+  fail when the engines' outputs differ or differ from the vector.
 
 ## Acceptance scenarios
 
@@ -495,13 +653,30 @@ Traverse MUST:
 21. (0.7.0) A v2 guest whose `model_alloc` is missing, traps, or returns a
     zero, negative, out-of-bounds, or overlapping region fails closed before
     any input is written; `abi_version: 3` is `manifest_invalid`.
+22. (0.8.0) A `commercial` app registering a `prohibited` package →
+    `rights_policy_denied` with `detail`; a `non_commercial` app accepts it;
+    a host requiring commercial usage denies it even for a `non_commercial`
+    app; an app with pins and no `model_usage` → `usage_undeclared`.
+23. (0.8.0) A package revoked in the status map → `package_revoked` at
+    registration, and at the next execute after a mid-session revocation; a
+    deprecated package executes and its evidence shows `status: deprecated`.
+24. (0.8.0) A `2.1.0` derivative whose `commercial_use` is more permissive
+    than its source → `rights_inconsistent`; `derivation` in `2.0.0` →
+    `manifest_invalid`; a valid derivative's `derivation` appears unchanged in
+    the rights record and evidence.
+25. (0.9.0) A package built with only `traverse-cli model` (sign, pin,
+    verify, conformance) from an unsigned manifest and WASM registers on
+    native and web hosts. A tampered, untrusted, rights-inconsistent,
+    over-ceiling, or importing package fails `model verify` with the same
+    reason a host reports.
 
 ## Compatibility and non-goals
 
 Non-goals: production animal-recognition model selection; third-party weight
 licensing/download (a real licensed model package is `#1461`); Registry key
 distribution/rotation service; key revocation after registration (takes
-effect on re-activation); microphone/codecs; UI; Callweave workflow composition;
+effect on re-activation); a Traverse-published or online package status
+list (0.8.0: hosts supply the map); SPDX license-compatibility evaluation; microphone/codecs; UI; Callweave workflow composition;
 cloud LMM transport; training; guest `model_invoke` in v1; Spec 045
 candidate semantics.
 

@@ -1,16 +1,21 @@
-//! Spec 138 exact-ref model host behind the sixth audited C-ABI symbol,
-//! `traverse_swift_host_model_call` (Decision 104, ADR-0078). This module is
-//! safe Rust: the only pointer handling stays in `lib.rs`.
+//! Safe, framed Spec 138 exact-ref model host protocol shared by the native
+//! shims (Decision 108): the Apple C ABI (`traverse_swift_host_model_call`,
+//! Decision 104, ADR-0078) and the Android JNI `modelCall`. This crate is
+//! safe Rust; each shim owns its own audited pointer/JNI handling and
+//! forwards one request frame to [`model_call`].
 //!
 //! **Frame** (request and response): `[u32 LE header_len][JSON header][payload]`.
 //! The header's `segments` object maps names to `[offset, length]` in the
 //! payload, so large model packages cross without base64 inflation.
 //!
 //! Operations (`header.op`): `create` (handle 0; returns a model handle),
-//! `register`, `stage_input`, `execute`, `read_output`, `rights`, `cancel`,
-//! `drop_ref`, `destroy`. Model-level failures are data
-//! (`{"ok":false,"error":{code,reason,message}}`); envelope failures return a
-//! non-OK status from the ABI.
+//! `register`, `stage_input`, `execute`, `read_output`, `rights`,
+//! `rights_record`, `set_package_status`, `cancel`, `drop_ref`, `destroy`.
+//! Model-level failures are data
+//! (`{"ok":false,"error":{code,reason,detail?,message}}`); envelope failures
+//! return a non-OK status from the ABI. Rights enforcement (usage policy,
+//! package status, derivation, evidence) is the shared Rust core's
+//! (Spec 138 0.8.0, Decision 107).
 //!
 //! Model hosts live in a registry of `Arc` states: `execute` holds the
 //! connector lock for the whole inference while `cancel` only flips the
@@ -25,7 +30,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use traverse_runtime::exact_model::{
     ExactModelHostConnector, ExactModelPin, ExecutionPolicy, HostModelLimits, ModelEngine,
-    PLACEMENT_WASM_CPU, TrustedModelKeys,
+    ModelUsage, PLACEMENT_WASM_CPU, PackageStatusEntry, TrustedModelKeys,
 };
 use traverse_runtime::host_connector_dispatch::{
     HostConnectorError, HostConnectorHostRequest, HostConnectorPort, MODEL_EXECUTE_OPERATION,
@@ -41,7 +46,29 @@ pub enum EnvelopeError {
     InvalidHandle,
 }
 
+/// Identity a native shim stamps on its `model.execute` requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostProfile {
+    /// Host-connector binding id.
+    pub binding_id: &'static str,
+    /// Target family (`apple`, `android`).
+    pub target_family: &'static str,
+}
+
+/// The iOS/macOS shim (`traverse-swift-host`).
+pub const APPLE: HostProfile = HostProfile {
+    binding_id: "swift-exact-model-host",
+    target_family: "apple",
+};
+
+/// The Android shim (`traverse-android-host`, Decision 108).
+pub const ANDROID: HostProfile = HostProfile {
+    binding_id: "android-exact-model-host",
+    target_family: "android",
+};
+
 struct ModelHost {
+    profile: HostProfile,
     connector: Mutex<ExactModelHostConnector>,
     cancel: Arc<AtomicBool>,
     running: Mutex<Option<String>>,
@@ -139,17 +166,15 @@ impl<'a> Request<'a> {
 }
 
 fn error_response(error: &HostConnectorError) -> Vec<u8> {
-    encode_frame(
-        &json!({
-            "ok": false,
-            "error": {
-                "code": error.code.as_str(),
-                "reason": error.reason.map(ModelFailureReason::as_str),
-                "message": error.message,
-            }
-        }),
-        &[],
-    )
+    let mut body = json!({
+        "code": error.code.as_str(),
+        "reason": error.reason.map(ModelFailureReason::as_str),
+        "message": error.message,
+    });
+    if let Some(detail) = &error.detail {
+        body["detail"] = json!(detail);
+    }
+    encode_frame(&json!({ "ok": false, "error": body }), &[])
 }
 
 fn ok(header: Value) -> Vec<u8> {
@@ -165,14 +190,18 @@ fn ok(header: Value) -> Vec<u8> {
 /// Returns [`EnvelopeError`] for malformed frames/headers/segments, unknown
 /// operations, or an unknown handle. Model failures are encoded in the
 /// returned response frame instead.
-pub fn model_call(handle: u64, frame: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+pub fn model_call(
+    profile: &HostProfile,
+    handle: u64,
+    frame: &[u8],
+) -> Result<Vec<u8>, EnvelopeError> {
     let request = Request::parse(frame)?;
     let op = request.str("op")?;
     if op == "create" {
         if handle != 0 {
             return Err(EnvelopeError::InvalidInput("create_requires_handle_zero"));
         }
-        return create(&request);
+        return create(*profile, &request);
     }
     let host = lock(registry())
         .get(&handle)
@@ -184,6 +213,8 @@ pub fn model_call(handle: u64, frame: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
         "execute" => execute(&host, &request),
         "read_output" => read_output(&host, &request),
         "rights" => rights(&host, &request),
+        "rights_record" => rights_record(&host, &request),
+        "set_package_status" => set_package_status(&host, &request),
         "cancel" => Ok(cancel(&host, &request)),
         "drop_ref" => drop_ref(&host, &request),
         "destroy" => {
@@ -194,7 +225,7 @@ pub fn model_call(handle: u64, frame: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
     }
 }
 
-fn create(request: &Request<'_>) -> Result<Vec<u8>, EnvelopeError> {
+fn create(profile: HostProfile, request: &Request<'_>) -> Result<Vec<u8>, EnvelopeError> {
     let pins: Vec<ExactModelPin> = request
         .header
         .get("pins")
@@ -233,7 +264,24 @@ fn create(request: &Request<'_>) -> Result<Vec<u8>, EnvelopeError> {
         max_memory_bytes: limit("max_memory_bytes")?,
         max_fuel: limit("max_fuel")?,
     };
+    // App `model_usage` (Decision 107): absent stays undeclared so
+    // registration fails closed with `usage_undeclared`.
+    let model_usage = match request.header.get("model_usage") {
+        None => None,
+        Some(value) => Some(
+            serde_json::from_value::<ModelUsage>(value.clone())
+                .map_err(|_| EnvelopeError::InvalidInput("model_usage"))?,
+        ),
+    };
+    let host_requires_commercial = match request.header.get("host_requires_commercial") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or(EnvelopeError::InvalidInput("host_requires_commercial"))?,
+    };
     let mut connector = ExactModelHostConnector::new(pins, trusted);
+    connector.model_usage = model_usage;
+    connector.host_requires_commercial = host_requires_commercial;
     connector.engine = ModelEngine::Wasmi;
     connector.host_limits = host_limits;
     let cancel = Arc::clone(&connector.cancel);
@@ -241,6 +289,7 @@ fn create(request: &Request<'_>) -> Result<Vec<u8>, EnvelopeError> {
     lock(registry()).insert(
         id,
         Arc::new(ModelHost {
+            profile,
             connector: Mutex::new(connector),
             cancel,
             running: Mutex::new(None),
@@ -321,8 +370,8 @@ fn execute(host: &ModelHost, request: &Request<'_>) -> Result<Vec<u8>, EnvelopeE
     let result = connector.invoke(&HostConnectorHostRequest {
         connector_id: MODEL_RUNTIME_CONNECTOR.to_string(),
         operation: MODEL_EXECUTE_OPERATION.to_string(),
-        binding_id: "swift-exact-model-host".to_string(),
-        target_family: "apple".to_string(),
+        binding_id: host.profile.binding_id.to_string(),
+        target_family: host.profile.target_family.to_string(),
         correlation_id: request.str("execution_id")?.to_string(),
         payload: payload.clone(),
         cancel_requested: false,
@@ -341,7 +390,9 @@ fn execute(host: &ModelHost, request: &Request<'_>) -> Result<Vec<u8>, EnvelopeE
         .map(|bytes| bytes.len())
         .unwrap_or(0);
     let model_ref = payload.get("model_ref").cloned().unwrap_or(Value::Null);
+    let evidence = json!(result.model_evidence);
     Ok(ok(json!({
+        "model_evidence": evidence,
         "output_ref": output_ref,
         "placement": PLACEMENT_WASM_CPU,
         "target": PLACEMENT_WASM_CPU,
@@ -350,6 +401,7 @@ fn execute(host: &ModelHost, request: &Request<'_>) -> Result<Vec<u8>, EnvelopeE
             "model_ref": model_ref,
             "placement": PLACEMENT_WASM_CPU,
             "data_classification": payload.get("data_classification").cloned().unwrap_or(Value::Null),
+            "model_evidence": evidence,
             "usage": {
                 "input_bytes": input_bytes,
                 "output_bytes": output_bytes,
@@ -379,6 +431,25 @@ fn rights(host: &ModelHost, request: &Request<'_>) -> Result<Vec<u8>, EnvelopeEr
             serde_json::to_value(rights).unwrap_or(Value::Null)
         });
     Ok(ok(json!({ "rights": rights })))
+}
+
+/// Verified rights record (including `revoked` status) for host/UI display.
+fn rights_record(host: &ModelHost, request: &Request<'_>) -> Result<Vec<u8>, EnvelopeError> {
+    let digest = request.str("digest")?;
+    let record = lock(&host.connector).model_rights_record(digest);
+    Ok(ok(json!({ "record": record })))
+}
+
+/// Replace the host-owned package status map (`entries`: digest → entry).
+fn set_package_status(host: &ModelHost, request: &Request<'_>) -> Result<Vec<u8>, EnvelopeError> {
+    let entries: HashMap<String, PackageStatusEntry> = request
+        .header
+        .get("entries")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .ok_or(EnvelopeError::InvalidInput("entries"))?;
+    lock(&host.connector).set_package_status(entries);
+    Ok(ok(json!({})))
 }
 
 /// Flip the shared cancel flag only when the named execution is running, so
@@ -422,6 +493,8 @@ fn hex_decode(value: &str) -> Option<Vec<u8>> {
 )]
 mod tests {
     use super::*;
+
+    const TEST_PROFILE: HostProfile = APPLE;
     use traverse_runtime::exact_model::{digest_hex, encode_guest_frame, sign_model_manifest};
 
     const MODELS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/models");
@@ -435,6 +508,14 @@ mod tests {
         key[field].as_str().expect("hex").to_string()
     }
 
+    fn hex_encode(bytes: &[u8]) -> String {
+        use std::fmt::Write;
+        bytes.iter().fold(String::new(), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+    }
+
     fn frame(header: &Value, segments: &[(&str, &[u8])]) -> Vec<u8> {
         encode_frame(header, segments)
     }
@@ -446,7 +527,7 @@ mod tests {
     }
 
     fn call(handle: u64, header: &Value, segments: &[(&str, &[u8])]) -> Value {
-        decode(&model_call(handle, &frame(header, segments)).expect("envelope ok")).0
+        decode(&model_call(&TEST_PROFILE, handle, &frame(header, segments)).expect("envelope ok")).0
     }
 
     fn digits_pin() -> Value {
@@ -462,7 +543,7 @@ mod tests {
     fn create(pins: Value) -> u64 {
         let response = call(
             0,
-            &json!({ "op": "create", "pins": pins, "trusted_public_keys_hex": [key("public_key_hex")], "limits": limits() }),
+            &json!({ "op": "create", "pins": pins, "trusted_public_keys_hex": [key("public_key_hex")], "limits": limits(), "model_usage": "commercial" }),
             &[],
         );
         assert_eq!(response["ok"], json!(true), "{response}");
@@ -510,6 +591,268 @@ mod tests {
             .to_string()
     }
 
+    /// Shared rights conformance suite (Spec 138 0.8.0, FR-041) through the
+    /// framed C-ABI call the Swift package uses: same codes, reasons,
+    /// details, records, and evidence as the native runner.
+    #[test]
+    fn rights_conformance_suite_passes_through_the_framed_model_call() {
+        let suite: Value =
+            serde_json::from_slice(&read("rights-conformance/suite.json")).expect("suite");
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+        let file = |path: String| std::fs::read(format!("{root}/{path}")).expect("suite file");
+        let run = &suite["execute"];
+        for case in suite["cases"].as_array().expect("cases") {
+            let id = case["id"].as_str().expect("id");
+            let mut create = json!({
+                "op": "create",
+                "pins": case["pins"],
+                "trusted_public_keys_hex": [suite["trusted_public_key_hex"]],
+                "limits": limits(),
+                "host_requires_commercial": case["host_requires_commercial"].as_bool().unwrap_or(false),
+            });
+            if !case["model_usage"].is_null() {
+                create["model_usage"] = case["model_usage"].clone();
+            }
+            let handle = call(0, &create, &[])["handle"].as_u64().expect("handle");
+            let set_status = |entries: &Value| {
+                let response = call(
+                    handle,
+                    &json!({ "op": "set_package_status", "entries": entries }),
+                    &[],
+                );
+                assert_eq!(response["ok"], json!(true));
+            };
+            set_status(&case.get("package_status").cloned().unwrap_or(json!({})));
+            let pin_for = |package: &str| {
+                case["pins"]
+                    .as_array()
+                    .expect("pins")
+                    .iter()
+                    .find(|pin| pin["model_id"] == json!(format!("fixture.rights.{package}")))
+                    .expect("pin")
+                    .clone()
+            };
+            let as_error = |response: &Value| {
+                let error = &response["error"];
+                let mut out =
+                    json!({ "ok": false, "code": error["code"], "reason": error["reason"] });
+                if let Some(detail) = error.get("detail") {
+                    out["detail"] = detail.clone();
+                }
+                out
+            };
+            for (index, step) in case["steps"].as_array().expect("steps").iter().enumerate() {
+                let package = step["package"].as_str().unwrap_or_default();
+                let actual = match step["op"].as_str().expect("op") {
+                    "register" => {
+                        let dir =
+                            format!("{}/{package}", suite["package_dir"].as_str().expect("dir"));
+                        let mut wasm = file(suite["wasm_path"].as_str().expect("wasm").to_string());
+                        let mut signature = file(format!("{dir}/model.sig.json"));
+                        match step["tamper"].as_str() {
+                            Some("wasm") => wasm.push(0),
+                            Some(_) => {
+                                let mut document: Value =
+                                    serde_json::from_slice(&signature).expect("sig");
+                                let mut bytes =
+                                    hex_decode(document["signature"].as_str().expect("sig"))
+                                        .expect("hex");
+                                bytes[0] ^= 0x01;
+                                document["signature"] = json!(hex_encode(&bytes));
+                                signature = serde_json::to_vec(&document).expect("sig bytes");
+                            }
+                            None => {}
+                        }
+                        let response = call(
+                            handle,
+                            &json!({ "op": "register" }),
+                            &[
+                                ("manifest", &file(format!("{dir}/model.manifest.json"))),
+                                ("wasm", &wasm),
+                                ("signature", &signature),
+                            ],
+                        );
+                        if response["ok"] == json!(true) {
+                            json!({ "ok": true, "digest": response["digest"] })
+                        } else {
+                            as_error(&response)
+                        }
+                    }
+                    "execute" => {
+                        let pin = pin_for(package);
+                        let input =
+                            hex_decode(run["input_hex"].as_str().expect("input")).expect("hex");
+                        let input_ref = stage(handle, &input);
+                        let mut header = json!({
+                            "op": "execute",
+                            "execution_id": "rights",
+                            "allowed_classifications": run["allowed_classifications"],
+                            "payload": {
+                                "model_ref": { "model_id": pin["model_id"], "version": pin["version"], "digest": pin["digest"] },
+                                "input_ref": input_ref,
+                            }
+                        });
+                        for field in [
+                            "policy_ref",
+                            "data_classification",
+                            "input_schema_ref",
+                            "input_schema_version",
+                            "max_output_bytes",
+                        ] {
+                            header["payload"][field] = run[field].clone();
+                        }
+                        let response = call(handle, &header, &[]);
+                        if response["ok"] == json!(true) {
+                            assert_eq!(
+                                response["trace"]["model_evidence"],
+                                response["model_evidence"]
+                            );
+                            let (_, output) = decode(
+                                &model_call(&TEST_PROFILE,
+                                    handle,
+                                    &frame(&json!({ "op": "read_output", "output_ref": response["output_ref"], "max_bytes": 4096 }), &[]),
+                                )
+                                .expect("read"),
+                            );
+                            json!({
+                                "ok": true,
+                                "output_hex": hex_encode(&output),
+                                "model_evidence": response["model_evidence"],
+                            })
+                        } else {
+                            as_error(&response)
+                        }
+                    }
+                    "rights_record" => {
+                        let response = call(
+                            handle,
+                            &json!({ "op": "rights_record", "digest": pin_for(package)["digest"] }),
+                            &[],
+                        );
+                        response["record"].clone()
+                    }
+                    _ => {
+                        set_status(&step["entries"]);
+                        continue;
+                    }
+                };
+                assert_eq!(actual, step["expect"], "{id} step {index}");
+            }
+            call(handle, &json!({ "op": "destroy" }), &[]);
+        }
+    }
+
+    /// #1591: the simd128 ONNX runner package runs on the Swift host's
+    /// `wasmi` (simd enabled) byte-identically to the checked-in vector that
+    /// wasmtime, native wasmi, and the browser also match.
+    #[test]
+    fn onnx_runner_package_matches_the_vector_through_the_framed_model_call() {
+        let vector: Value =
+            serde_json::from_slice(&read("conformance/signed-digits-onnx.json")).expect("vector");
+        let pin = vector["pin"].clone();
+        // The Swift package's default (phone) ceilings: the runner package
+        // declares 4 MiB memory and 2e9 fuel.
+        let handle = call(
+            0,
+            &json!({
+                "op": "create", "pins": [pin.clone()],
+                "trusted_public_keys_hex": [key("public_key_hex")], "model_usage": "commercial",
+                "limits": { "max_package_bytes": 128 * 1024 * 1024, "max_memory_bytes": 256 * 1024 * 1024, "max_fuel": 20_000_000_000_u64 },
+            }),
+            &[],
+        )["handle"]
+            .as_u64()
+            .expect("handle");
+        let registered = call(
+            handle,
+            &json!({ "op": "register" }),
+            &[
+                ("manifest", &read("digits-onnx-1.0.0/model.manifest.json")),
+                ("wasm", &read("digits-onnx-1.0.0/model.wasm")),
+                ("signature", &read("digits-onnx-1.0.0/model.sig.json")),
+            ],
+        );
+        assert_eq!(registered["digest"], pin["digest"], "{registered}");
+        for case in vector["cases"].as_array().expect("cases") {
+            let input = hex_decode(case["input_frame_hex"].as_str().expect("in")).expect("hex");
+            let input_ref = stage(handle, &input);
+            let mut header = execute_header(&pin, &input_ref, "onnx");
+            header["payload"]["input_schema_ref"] = vector["request"]["input_schema_ref"].clone();
+            header["payload"]["max_output_bytes"] = json!(56);
+            let executed = call(handle, &header, &[]);
+            assert_eq!(executed["ok"], json!(true), "{executed}");
+            let (_, output) = decode(
+                &model_call(&TEST_PROFILE,
+                    handle,
+                    &frame(&json!({ "op": "read_output", "output_ref": executed["output_ref"], "max_bytes": 56 }), &[]),
+                )
+                .expect("read"),
+            );
+            assert_eq!(
+                hex_encode(&output),
+                case["output_frame_hex"].as_str().expect("out")
+            );
+        }
+        call(handle, &json!({ "op": "destroy" }), &[]);
+    }
+
+    /// Decision 108: both shims run the identical protocol; only the stamped
+    /// host identity differs.
+    #[test]
+    fn android_profile_runs_the_same_signed_vector_as_apple() {
+        assert_eq!(
+            (ANDROID.binding_id, ANDROID.target_family),
+            ("android-exact-model-host", "android")
+        );
+        let pin = digits_pin();
+        let created = decode(
+            &model_call(
+                &ANDROID,
+                0,
+                &frame(
+                    &json!({ "op": "create", "pins": [pin.clone()], "trusted_public_keys_hex": [key("public_key_hex")], "limits": limits(), "model_usage": "commercial" }),
+                    &[],
+                ),
+            )
+            .expect("create"),
+        )
+        .0;
+        let handle = created["handle"].as_u64().expect("handle");
+        assert_eq!(register_digits(handle)["digest"], pin["digest"]);
+        let vector: Value =
+            serde_json::from_slice(&read("conformance/signed-digits-mlp.json")).expect("vector");
+        let case = &vector["cases"][0];
+        let input = hex_decode(case["input_frame_hex"].as_str().expect("in")).expect("hex");
+        let input_ref = stage(handle, &input);
+        let executed = call(handle, &execute_header(&pin, &input_ref, "android"), &[]);
+        assert_eq!(executed["ok"], json!(true), "{executed}");
+        call(handle, &json!({ "op": "destroy" }), &[]);
+    }
+
+    #[test]
+    fn set_package_status_rejects_malformed_entries() {
+        let handle = create(json!([digits_pin()]));
+        assert_eq!(
+            model_call(
+                &TEST_PROFILE,
+                handle,
+                &frame(
+                    &json!({ "op": "set_package_status", "entries": { "d": { "status": "gone" } } }),
+                    &[]
+                ),
+            ),
+            Err(EnvelopeError::InvalidInput("entries"))
+        );
+        assert_eq!(
+            model_call(
+                &TEST_PROFILE,
+                handle,
+                &frame(&json!({ "op": "rights_record" }), &[])
+            ),
+            Err(EnvelopeError::InvalidInput("digest"))
+        );
+    }
+
     #[test]
     fn digits_package_round_trips_through_the_framed_model_call() {
         let pin = digits_pin();
@@ -531,7 +874,7 @@ mod tests {
             );
             assert_eq!(executed["trace"]["usage"]["output_bytes"], json!(56));
             let (header, payload) = decode(
-                &model_call(
+                &model_call(&TEST_PROFILE,
                     handle,
                     &frame(
                         &json!({ "op": "read_output", "output_ref": executed["output_ref"], "max_bytes": 64 }),
@@ -581,6 +924,7 @@ mod tests {
         );
         assert_eq!(
             model_call(
+                &TEST_PROFILE,
                 handle,
                 &frame(&json!({ "op": "rights", "digest": "x" }), &[])
             ),
@@ -621,6 +965,7 @@ mod tests {
         let tight = call(
             0,
             &json!({ "op": "create", "pins": [pin], "trusted_public_keys_hex": [key("public_key_hex")],
+                     "model_usage": "commercial",
                      "limits": { "max_package_bytes": 100, "max_memory_bytes": 1_048_576, "max_fuel": 1_000_000 } }),
             &[],
         );
@@ -646,7 +991,7 @@ mod tests {
 
     #[test]
     fn envelope_errors_are_rejected_before_any_model_work() {
-        let bad = |bytes: &[u8]| model_call(0, bytes).expect_err("envelope");
+        let bad = |bytes: &[u8]| model_call(&TEST_PROFILE, 0, bytes).expect_err("envelope");
         assert!(matches!(bad(b"\x01"), EnvelopeError::InvalidInput(_)));
         assert!(matches!(
             bad(&[9, 0, 0, 0, b'{']),
@@ -664,7 +1009,7 @@ mod tests {
             EnvelopeError::InvalidInput("op")
         );
         assert_eq!(
-            model_call(7, &frame(&json!({ "op": "create" }), &[])),
+            model_call(&TEST_PROFILE, 7, &frame(&json!({ "op": "create" }), &[])),
             Err(EnvelopeError::InvalidInput("create_requires_handle_zero"))
         );
         for (header, field) in [
@@ -693,6 +1038,7 @@ mod tests {
         }
         assert_eq!(
             model_call(
+                &TEST_PROFILE,
                 999_999,
                 &frame(&json!({ "op": "rights", "digest": "x" }), &[])
             ),
@@ -701,7 +1047,7 @@ mod tests {
 
         let handle = create(json!([]));
         let env = |header: Value, segments: &[(&str, &[u8])]| {
-            model_call(handle, &frame(&header, segments)).expect_err("envelope")
+            model_call(&TEST_PROFILE, handle, &frame(&header, segments)).expect_err("envelope")
         };
         assert_eq!(
             env(json!({ "op": "nope" }), &[]),
@@ -818,8 +1164,9 @@ mod tests {
         let input_ref = stage(handle, &encode_guest_frame(2, &[1], &[0; 4]));
         let header = execute_header(&pin, &input_ref, "exec-long");
         let worker = std::thread::spawn(move || call(handle, &header, &[]));
-        let mut cancelled = false;
-        for _ in 0..500 {
+        // Poll until the execution is running; the timing-dependent retry
+        // count stays out of the coverage-visible control flow.
+        let cancelled = (0..500).any(|_| {
             std::thread::sleep(std::time::Duration::from_millis(10));
             let wrong = call(
                 handle,
@@ -827,17 +1174,13 @@ mod tests {
                 &[],
             );
             assert_eq!(wrong["cancelled"], json!(false));
-            if call(
+            call(
                 handle,
                 &json!({ "op": "cancel", "execution_id": "exec-long" }),
                 &[],
             )["cancelled"]
                 == json!(true)
-            {
-                cancelled = true;
-                break;
-            }
-        }
+        });
         assert!(cancelled, "execution never became cancellable");
         let result = worker.join().expect("worker");
         assert_eq!(result["ok"], json!(false));
@@ -875,7 +1218,7 @@ mod tests {
         let executed = call(handle, &header, &[]);
         assert_eq!(executed["ok"], json!(true), "{executed}");
         let (response, payload) = decode(
-            &model_call(
+            &model_call(&TEST_PROFILE,
                 handle,
                 &frame(&json!({ "op": "read_output", "output_ref": executed["output_ref"], "max_bytes": 4096 }), &[]),
             )

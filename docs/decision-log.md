@@ -5734,3 +5734,303 @@ engine and build is bit-identical to every other.
 ### Approval
 
 Approved by Enrico (2026-09-30): "GO: simd required, int8 tolerance 5e-3".
+
+## Decision 107: Model-Rights Enforcement — App Usage Policy, Host-Owned Package Status, Structured Derivation, Rights in Evidence
+
+- **Date**: 2026-10-01
+- **Status**: Accepted
+- **Governing specs**: `138-governed-exact-model-execution` (amendment to the
+  next minor version lands with the runtime ticket)
+- **Related issues**: `#1603` (umbrella); `#1599` runtime + suite, `#1600`
+  web, `#1601` Swift, `#1602` .NET; DoD added to `#1580` (Kotlin), `#1589` /
+  `#1591` (CLI and ONNX runner); boundary with `#1567` (key lifecycle)
+- **Origin**: `/brainstorm` on an app developer's request for consumer-side
+  model-rights enforcement over signed Spec 138 packages
+
+### Context
+
+Decision 101 already covers most of the request:
+- signature and host-trusted key;
+- manifest and WASM digest;
+- target compatibility;
+- required, complete `rights`;
+- an exact pin match on `license_id` / `commercial_use`;
+- the verified offline cache;
+- no substitution;
+- read-only rights exposure.
+
+The request also needs things Spec 138 lacks:
+- an app-level usage policy, rather than a per-pin exact match;
+- revocation or deprecation of an individual package (signed manifests are
+  immutable, and `#1567` handles only key revocation, through a release);
+- structured conversion/derivative provenance (today a free-text hash in
+  `rights.attribution`);
+- rights in execution evidence (FR-011 traces carry only id, version and
+  digest);
+- a structured denial record;
+- one conformance contract proven across embedders (Kotlin and .NET have no
+  model support).
+
+### Decision
+
+These are project-wide rules for every exact-ref model package and every
+model-capable embedder. They make no app-, model- or target-specific
+assumptions.
+
+1. **App-declared usage, checked against a fixed table.**
+   - An app with `exact_model_dependencies` MUST declare
+     `model_usage: commercial | non_commercial`.
+   - Every host applies the same fixed table:
+     - `commercial` accepts a package with `commercial_use: allowed` only;
+     - `non_commercial` accepts `allowed` or `prohibited`;
+     - `restricted` is accepted only when the pin declares
+       `commercial_use: restricted`.
+   - Pins keep the exact `license_id` / `commercial_use` match (Decision 101).
+2. **The app declares usage; the host may only tighten it.** A host MAY force
+   the effective usage to `commercial`. It can never relax it to
+   `non_commercial`. This is the same narrowing rule as trust roots.
+3. **A missing usage fails closed.** An app with model pins and no
+   `model_usage` fails at manifest validation with the new reason
+   `usage_undeclared`. This is breaking: model-using app manifests add one
+   field.
+4. **Policy denials carry a new reason and a structured detail.**
+   - The new reason is `rights_policy_denied`.
+   - Every rights-related failure carries an optional `detail` with
+     `{model_id, version, digest, field, expected, actual, effective_usage}`.
+   - The shape is identical in every host and is checked by conformance, so
+     a UI can explain a denial without re-deriving policy.
+5. **Package status is a host-owned input.**
+   - The host configures a status map
+     `{digest → {status: deprecated | revoked, reason}}` next to the trust
+     roots.
+   - Traverse does not distribute the list, and there is no network check.
+   - A `revoked` package fails closed with the new reason `package_revoked`.
+6. **Status is re-checked at register, activate and every execute.** The host
+   can replace the map at runtime. Each execute does a map lookup (no crypto),
+   so a revocation blocks the very next call.
+7. **`deprecated` runs normally but is flagged.** `status: deprecated` and its
+   reason appear in the rights record, in execution evidence and as a trace
+   warning. Forcing an upgrade is what `revoked` is for.
+8. **Optional structured `rights.derivation`.**
+   - Shape: `{kind: converted | quantized | fine_tuned, source_digest,
+     source_license_id, source_commercial_use, source_url}`. When present,
+     every field is required and non-empty.
+   - It is required for packages built by `traverse-cli model package-onnx`.
+   - Manifest `schema_version` `2.1.0` adds it, and hosts accept `2.0.0` and
+     `2.1.0`. A host that predates this change rejects `2.1.0`.
+9. **One fixed derivation rule.**
+   - A package's `commercial_use` may not be more permissive than
+     `derivation.source_commercial_use`, using the order
+     `prohibited < restricted < allowed`.
+   - A violation fails with the new reason `rights_inconsistent`.
+   - License-ID compatibility is not evaluated.
+10. **Full rights in execution evidence.** Every `model.execute` result and
+    public trace event carries:
+    - `model_id`, `version` and `digest`;
+    - the full signed `rights`, including `derivation`;
+    - `status`;
+    - `effective_usage`.
+
+    Tensor bytes and secrets stay redacted (FR-011).
+11. **One shared conformance suite.**
+    - It is a fixture-driven suite of signed packages plus JSON cases giving
+      the expected code, reason, detail and evidence.
+    - It covers the requester's ten scenarios:
+      - a permissive package;
+      - a non-commercial package;
+      - a restricted package accepted only by a matching policy;
+      - missing license or attribution;
+      - an unknown `commercial_use`;
+      - a digest or signature mismatch;
+      - a revoked or deprecated package;
+      - offline cache-only activation;
+      - rights propagation into evidence;
+      - native/browser parity.
+    - Rust, web and Swift MUST pass it now. Passing it is DoD for Kotlin
+      (`#1580`) and for a new .NET parity ticket.
+    - The docs list which embedders can run models.
+12. **Work split.** One umbrella ticket and three new children:
+    - (a) the Spec 138 amendment, the Rust runtime and the shared suite
+      (Ready);
+    - (b) web parity (Blocked on a);
+    - (c) Swift host/FFI parity (Blocked on a).
+
+    The CLI part (`model verify` / `package-onnx` emit and check
+    `rights.derivation`) is added to the DoD of `#1589` / `#1591`, not filed
+    as a new ticket. A new future .NET model-execution parity ticket is
+    filed, and `#1580` gains the suite as DoD.
+
+### Alternatives Considered
+
+- Policy shape:
+  - Keep exact-match pins only. Rejected: there is no app-level statement of
+    usage, so the request goes unanswered.
+  - Pins list the accepted `commercial_use` values. Rejected: easy to
+    misconfigure per pin, and it is effectively the allowlist engine Decision
+    101 rejected.
+- Usage owner:
+  - The app manifest only. Rejected: a host shipping commercially couldn't
+    enforce that.
+  - Host config only. Rejected: the same bundle would behave differently per
+    host, which contradicts "app declares, host checks".
+- Denial reporting:
+  - A new reason with no detail. Rejected: the UI would have to re-derive the
+    policy.
+  - Reusing `rights_mismatch`. Rejected: it conflates "package differs from
+    pin" with "forbidden by usage".
+- Revocation:
+  - A Traverse-published signed status list. Rejected for now: it needs
+    freshness, anti-replay and publishing work, and overlaps `#1567`.
+  - Keeping revocation a non-goal. Rejected: a single package couldn't be
+    revoked without revoking its signer.
+- Revalidation at register and activate only. Rejected: a revoked model
+  would keep running until re-activation.
+- `deprecated`:
+  - Block only new registrations. Rejected: devices would diverge depending
+    on when they installed.
+  - A per-app opt-in. Rejected: another policy knob in every host.
+- Derivation:
+  - Keep free text in `attribution`. Rejected: not enforceable.
+  - A separate signed provenance file. Rejected: new load plumbing in every
+    host, as with the extra file Decision 105 rejected.
+- Derivation check:
+  - Check the structure only. Rejected: NC weights could be relabelled as
+    commercial without detection.
+  - Also check SPDX compatibility. Rejected: a license-law engine in five
+    languages.
+- Evidence: compact fields plus a lookup. Rejected: archived evidence could
+  not be interpreted without the host that produced it.
+- Parity: block until Kotlin and .NET land. Rejected: holds Rust, web and
+  Swift behind two unrelated designs.
+- Missing usage defaults to `commercial`. Rejected: an implicit default, and
+  NC apps would get a confusing denial.
+- Work split: one cross-host ticket. Rejected: the spec and suite would not
+  be gated before host work.
+
+### Approval
+
+Approved by Enrico in `/brainstorm` (2026-10-01): every recommended option
+accepted.
+
+## Decision 108: Kotlin/Android Exact-Ref Model Execution — Native Rust via JNI, Shared Frame Crate, Fail-Closed Without the Library
+
+- **Date**: 2026-10-01
+- **Status**: Accepted
+- **Governing specs**: `138-governed-exact-model-execution` (amendment lands
+  with the JNI slice)
+- **Related issues**: `#1580`; precedent `#1579` (Swift, Decision 104,
+  ADR-0078); `#1599` (shared rights suite, Decision 107)
+- **Origin**: `/brainstorm` on `#1580`
+
+### Context
+
+The Kotlin embedder is an Android library (`minSdk 28`). It runs the Rust
+core `runtime.wasm` inside Chicory 1.7.5, a pure-JVM interpreter, with an
+`ExecutionListener` instruction and time budget. It has no Spec 138 model
+support at all, so Callweave's Android app cannot run a signed model.
+
+Three facts shaped the design:
+- the JDK's Ed25519 exists only from Android API 33;
+- Chicory's standard interpreter does not execute SIMD (its SIMD module needs
+  the Java Vector API, which Android lacks), so the `+simd128` ONNX runner,
+  and therefore BirdNET, cannot run on Chicory;
+- Swift solved the same problem by wrapping the Rust `ExactModelHostConnector`
+  in a native static library behind one framed C-ABI call (Decision 104).
+
+### Decision
+
+1. **Native Rust via JNI.** An Android shared library wraps the Rust
+   `ExactModelHostConnector` and `wasmi` (SIMD, auto-dispatch, fuel slices),
+   as Swift does. All Spec 138 rules come from the single Rust
+   implementation:
+   - Ed25519 verification;
+   - rights and the usage policy;
+   - package status;
+   - derivation;
+   - ceilings;
+   - evidence.
+2. **A shared frame crate.** The framed model-call protocol (`create`,
+   `register`, `stage_input`, `execute`, `read_output`, `rights`,
+   `rights_record`, `set_package_status`, `cancel`, `drop_ref`, `destroy`)
+   moves from `traverse-swift-host` into a new safe crate. It is used by:
+   - `traverse-swift-host`, which keeps its C-ABI shim;
+   - a new `traverse-android-host`, a JNI shim.
+
+   Parity between Apple and Android is therefore structural.
+3. **One framed `byte[]` JNI call, written with the `jni` crate.** The
+   boundary is `native byte[] modelCall(long handle, byte[] request)` on the
+   same frame format. Its `unsafe` is confined to one audited function,
+   recorded in a new ADR that mirrors ADR-0078.
+4. **Models only.** `runtime.wasm` keeps running on Chicory (Spec 1402 is
+   unchanged). Only `traverse.model-runtime` / `model.execute` goes to the
+   native library.
+5. **ABIs: `arm64-v8a` and `x86_64`, failing closed.** If the library cannot
+   load, model calls fail with `model_unavailable` and a new stable reason,
+   `engine_unavailable`. The rest of the embedder keeps working. There is no
+   Chicory fallback, and 32-bit ARM is not shipped.
+6. **Tests: a host-JVM library in CI now, an emulator later.** The JNI crate
+   also builds for the CI host, as a Linux `.so` or macOS `.dylib`. Kotlin
+   JUnit tests load it and must pass:
+   - the signed vectors byte-for-byte (classifier, digits-mlp, digits-onnx);
+   - the shared 21-case rights conformance suite.
+
+   Android-emulator instrumented tests are a follow-up ticket.
+7. **Distribution: built in the Kotlin publish job.** At release time,
+   `cargo-ndk` builds both ABIs into the AAR's `jniLibs`. No binaries are
+   committed, and there is no separate artifact release.
+8. **The Kotlin API mirrors Swift's `ExactModelHost`:**
+   - the constructor takes pins, trusted keys, `modelUsage`,
+     `hostRequiresCommercial`, and limits (phone defaults: 128 MiB package,
+     256 MiB memory, 2×10¹⁰ fuel);
+   - `registerPackage` and `execute` are suspend functions; coroutine
+     cancellation sends the frame's `cancel` op for mid-run interruption;
+   - staging, `modelRights` / `modelRightsRecord`, `setPackageStatus`, and a
+     `modelExecuteAdapter` for app commands.
+9. **Work split:** three slices under `#1580`, plus a follow-up ticket:
+   - (1) extract the shared frame crate, with `traverse-swift-host`
+     delegating to it and no behaviour change;
+   - (2) `traverse-android-host` plus the Kotlin `ExactModelHost`, with
+     host-JVM tests, the new ADR, and the Spec 138 amendment
+     (`engine_unavailable`);
+   - (3) the publish pipeline (`cargo-ndk` into the AAR);
+   - follow-up: emulator instrumented tests.
+
+### Alternatives Considered
+
+- Architecture:
+  - Rules in `runtime.wasm` with the guest on Chicory. Rejected: no SIMD,
+    so the ONNX runner and BirdNET cannot run, and the interpreter is slow.
+  - Pure Kotlin on Chicory. Rejected: a second rules copy, BouncyCastle or
+    API 33 for Ed25519, and no SIMD.
+- Code sharing:
+  - Copy `model_host.rs`. Rejected: the copies drift.
+  - One crate with two shims. Rejected: mixes Apple and Android release
+    concerns and widens one crate's unsafe surface.
+- JNI binding:
+  - Raw `extern "system"` functions. Rejected: more hand-written unsafe.
+  - Per-operation JNI methods. Rejected: a wider surface that diverges from
+    the Swift frame.
+- Scope: the whole runtime native. Rejected: reopens Spec 1402 and is out of
+  scope for `#1580`.
+- ABIs and fallback:
+  - Adding `armeabi-v7a`. Rejected: BirdNET-class memory doesn't fit, and it
+    is another target to test.
+  - A Chicory fallback. Rejected: a silent second engine path, contrary to
+    fail-closed.
+- Testing:
+  - An emulator job now. Rejected: slow and flaky for the first PR; it is a
+    follow-up instead.
+  - Rust-level tests only. Rejected: they never exercise JNI or the Kotlin
+    API.
+- Distribution:
+  - A separate native artifact release. Rejected: an extra pinning step that
+    only SwiftPM needs.
+  - Committed `.so` files. Rejected: binaries in the repo.
+- API: callback or Future based. Rejected: not idiomatic, and the embedder
+  already uses coroutines.
+- Split: one PR. Rejected: mixes a refactor, new unsafe code, and CI changes.
+
+### Approval
+
+Approved by Enrico in `/brainstorm` (2026-10-01): every recommended option
+accepted.
