@@ -1,5 +1,6 @@
 #![allow(clippy::default_trait_access, clippy::doc_markdown)]
 
+mod ai_admission;
 mod app_availability;
 mod app_events_websocket;
 mod app_runtime_events;
@@ -1541,9 +1542,18 @@ fn help_capability_publish() -> String {
     candidate under a local registry checkout, and open a human-reviewed
     registry PR. The command never publishes directly.
 
-    Newly published contracts with ai.model_backed=true must provide a
-    non-empty ai.models array of pinned attribution objects; legacy string[]
-    model references are not accepted for new model-backed publications.
+    Before any registry write (including --dry-run), the contract's ai
+    object is checked against every registry admission rule decidable from
+    the contract alone (registry Spec 001 FR-017, Spec 026). With
+    ai.model_backed=true, ai.models must be a non-empty array of objects.
+    Each object needs id, a valid SPDX spdx_expression, attribution_required,
+    a full-commit pin (huggingface_id + revision, or a source_url containing
+    a commit id), and the Spec 026 rights record: commercial_use,
+    redistribution and derivatives (not unknown), verification,
+    license_files, notice_files when attribution_required is true, and
+    derivation. Legacy string[] models are accepted only when model_backed is
+    false. Evidence digests and model-weights.json are still checked by
+    registry CI only; nothing is fetched.
 
   Required flags:
     --contract <path>       Capability contract JSON to publish.
@@ -4623,162 +4633,26 @@ fn capability_publish_at(
 
 type CapabilityPublishPlanError = (&'static str, String);
 
-fn model_attribution_error(reason: impl Into<String>) -> CapabilityPublishPlanError {
-    (
-        "capability_publish_model_attribution_invalid",
-        format!("registry Spec 001 FR-017 (Decision 124): {}", reason.into()),
-    )
-}
-
-/// Validate the new-publication rules from registry Spec 001 FR-017 before
-/// the publish path can make any registry writes. Registry CI remains
-/// authoritative for SPDX expression syntax.
+/// Spec 056 v1.1.0 FR-014/FR-018 (Decision 109): reject, before any registry
+/// write, every `ai` object registry CI would reject on rules decidable from
+/// the contract alone (registry Spec 001 FR-017, Spec 026). The message
+/// lists each failure with its registry CI error code.
 fn validate_publish_ai_model_metadata(contract: &Value) -> Result<(), CapabilityPublishPlanError> {
-    let Some(ai) = contract.get("ai") else {
+    let failures = ai_admission::ai_admission_errors(contract);
+    if failures.is_empty() {
         return Ok(());
-    };
-    let Some(ai) = ai.as_object() else {
-        return Err(model_attribution_error("$.ai must be an object"));
-    };
-    let Some(model_backed) = ai.get("model_backed").and_then(Value::as_bool) else {
-        return Err(model_attribution_error(
-            "$.ai.model_backed must be a boolean",
-        ));
-    };
-    let Some(models) = ai.get("models") else {
-        return if model_backed {
-            Err(model_attribution_error(
-                "$.ai.models must be a non-empty array for model_backed capabilities",
-            ))
-        } else {
-            Ok(())
-        };
-    };
-    let Some(models) = models.as_array() else {
-        return Err(model_attribution_error("$.ai.models must be an array"));
-    };
-    if models.is_empty() {
-        return if model_backed {
-            Err(model_attribution_error(
-                "$.ai.models must be a non-empty array for model_backed capabilities",
-            ))
-        } else {
-            Ok(())
-        };
     }
-
-    if models.iter().all(Value::is_string) {
-        return validate_legacy_model_ids(models, model_backed);
-    }
-    if !models.iter().all(Value::is_object) {
-        return Err(model_attribution_error(
-            "$.ai.models must contain only strings or only model reference objects; mixed or other entries are invalid",
-        ));
-    }
-    for (index, model) in models.iter().enumerate() {
-        validate_publish_model_ref(model, index)?;
-    }
-    Ok(())
-}
-
-fn validate_legacy_model_ids(
-    models: &[Value],
-    model_backed: bool,
-) -> Result<(), CapabilityPublishPlanError> {
-    for (index, model) in models.iter().enumerate() {
-        if model.as_str().is_none_or(|value| value.trim().is_empty()) {
-            return Err(model_attribution_error(format!(
-                "$.ai.models[{index}] must be a non-empty string"
-            )));
-        }
-    }
-    if model_backed {
-        return Err(model_attribution_error(
-            "new model_backed publications must use object-shaped ai.models entries, not the grandfathered string[] form",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_publish_model_ref(
-    model: &Value,
-    index: usize,
-) -> Result<(), CapabilityPublishPlanError> {
-    for field in ["id", "spdx_expression"] {
-        if model
-            .get(field)
-            .and_then(Value::as_str)
-            .is_none_or(|value| value.trim().is_empty())
-        {
-            return Err(model_attribution_error(format!(
-                "$.ai.models[{index}].{field} must be a non-empty string"
-            )));
-        }
-    }
-    if model
-        .get("attribution_required")
-        .and_then(Value::as_bool)
-        .is_none()
-    {
-        return Err(model_attribution_error(format!(
-            "$.ai.models[{index}].attribution_required must be a boolean"
-        )));
-    }
-
-    let huggingface_id = optional_model_ref_string(model, "huggingface_id", index)?;
-    let revision = optional_model_ref_string(model, "revision", index)?;
-    let source_url = optional_model_ref_string(model, "source_url", index)?;
-    if !(huggingface_id.is_some() && revision.is_some()) && source_url.is_none() {
-        return Err(model_attribution_error(format!(
-            "$.ai.models[{index}] must include either huggingface_id plus revision, or source_url"
-        )));
-    }
-    if source_url.is_some_and(|value| !is_safe_https_model_source_url(value)) {
-        return Err(model_attribution_error(format!(
-            "$.ai.models[{index}].source_url must be an absolute HTTPS URL without credentials"
-        )));
-    }
-    if model
-        .get("copyright")
-        .is_some_and(|value| !value.is_null() && !value.is_string())
-    {
-        return Err(model_attribution_error(format!(
-            "$.ai.models[{index}].copyright must be a string when present"
-        )));
-    }
-    Ok(())
-}
-
-fn optional_model_ref_string<'a>(
-    model: &'a Value,
-    field: &str,
-    index: usize,
-) -> Result<Option<&'a str>, CapabilityPublishPlanError> {
-    let Some(value) = model.get(field) else {
-        return Ok(None);
-    };
-    let Some(value) = value.as_str() else {
-        return Err(model_attribution_error(format!(
-            "$.ai.models[{index}].{field} must be a string when present"
-        )));
-    };
-    if value.trim().is_empty() {
-        return Err(model_attribution_error(format!(
-            "$.ai.models[{index}].{field} must be non-empty when present"
-        )));
-    }
-    Ok(Some(value))
-}
-
-fn is_safe_https_model_source_url(value: &str) -> bool {
-    let Some((scheme, remainder)) = value.split_once("://") else {
-        return false;
-    };
-    if !scheme.eq_ignore_ascii_case("https") || value.starts_with('/') || value.starts_with('~') {
-        return false;
-    }
-    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
-    !authority.is_empty() && !authority.contains('@') && !authority.chars().any(char::is_whitespace)
+    let details = failures
+        .iter()
+        .map(|failure| format!("[{}] {}", failure.code, failure.message))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err((
+        "capability_publish_model_attribution_invalid",
+        format!(
+            "registry admission rules (registry Spec 001 FR-017, Spec 026) reject the contract's ai object: {details}"
+        ),
+    ))
 }
 
 fn capability_publish_plan(
@@ -9387,46 +9261,61 @@ mod tests {
         assert!(runner.commands.borrow().is_empty());
     }
 
-    #[test]
-    fn capability_publish_preserves_pinned_model_attribution() {
-        let fixture = capability_publish_fixture();
-        let ai = serde_json::json!({
-            "model_backed": true,
-            "models": [
-                {
-                    "id": "birdnet-v2.4-int8",
-                    "spdx_expression": "MIT",
-                    "attribution_required": true,
-                    "huggingface_id": "example/birdnet",
-                    "revision": "0123456789abcdef0123456789abcdef01234567"
-                },
-                {
-                    "id": "external-classifier",
-                    "spdx_expression": "Apache-2.0",
-                    "attribution_required": false,
-                    "source_url": "https://models.example.test/classifier",
-                    "copyright": "Example Authors"
-                }
-            ]
-        });
+    fn pinned_model_ref() -> Value {
+        serde_json::json!({
+            "id": "birdnet-v2.4-int8",
+            "spdx_expression": "CC-BY-NC-SA-4.0",
+            "attribution_required": true,
+            "huggingface_id": "example/birdnet",
+            "revision": "0123456789abcdef0123456789abcdef01234567",
+            "commercial_use": "forbidden",
+            "redistribution": "allowed",
+            "derivatives": "conditional",
+            "license_files": [{
+                "url": "https://github.com/traverse-framework/registry/releases/download/artifacts/example.detect-1.0.0/LICENSE",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }],
+            "notice_files": [{
+                "url": "https://github.com/traverse-framework/registry/releases/download/artifacts/example.detect-1.0.0/NOTICE",
+                "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }],
+            "verification": {"status": "maintainer-declared"},
+            "derivation": null
+        })
+    }
+
+    fn write_fixture_ai(fixture: &CapabilityPublishFixture, ai: Value) -> Value {
         let mut contract: Value = serde_json::from_str(
             &fs::read_to_string(&fixture.contract).expect("fixture contract should read"),
         )
         .expect("fixture contract should parse");
-        contract["ai"] = ai.clone();
+        contract["ai"] = ai;
         fs::write(
             &fixture.contract,
             serde_json::to_string_pretty(&contract).expect("fixture contract should serialize"),
         )
         .expect("fixture contract should write");
+        contract
+    }
 
+    #[test]
+    fn capability_publish_preserves_pinned_model_attribution() {
+        let fixture = capability_publish_fixture();
+        let mut second = pinned_model_ref();
+        second["id"] = Value::from("external-classifier");
+        second["source_url"] = Value::from(
+            "https://github.com/example/classifier/blob/0123456789abcdef0123456789abcdef01234567/model.onnx",
+        );
+        second["copyright"] = Value::from("Example Authors");
+        let ai = serde_json::json!({"model_backed": true, "models": [pinned_model_ref(), second]});
+        let contract = write_fixture_ai(&fixture, ai.clone());
+
+        assert!(validate_publish_ai_model_metadata(&contract).is_ok());
         let plan = capability_publish_plan(&fixture.request(true), DEFAULT_REGISTRY_REPO)
             .expect("pinned model attribution should plan offline");
         let published: Value =
             serde_json::from_str(&plan.contract_json).expect("planned contract should parse");
-
         assert_eq!(published["ai"], ai);
-        assert!(validate_publish_ai_model_metadata(&contract).is_ok());
 
         let runner = RecordingPublishRunner::default();
         let output = capability_publish_at(&fixture.request(true), &runner)
@@ -9436,78 +9325,53 @@ mod tests {
         assert!(runner.commands.borrow().is_empty());
     }
 
+    /// Decision 109 / Spec 056 v1.1.0 acceptance scenario 6: rules registry CI
+    /// enforces must fail locally, before any registry write, naming the code.
     #[test]
-    fn capability_publish_rejects_invalid_model_metadata_before_registry_writes() {
-        let valid_ref = serde_json::json!({
-            "id": "fixture-model",
-            "spdx_expression": "MIT",
-            "attribution_required": true,
-            "huggingface_id": "example/model",
-            "revision": "0123456789abcdef0123456789abcdef01234567"
-        });
-        let invalid_ai_values = vec![
-            serde_json::json!(null),
-            serde_json::json!({"models": []}),
-            serde_json::json!({"model_backed": "true"}),
-            serde_json::json!({"model_backed": true}),
-            serde_json::json!({"model_backed": true, "models": []}),
-            serde_json::json!({"model_backed": true, "models": ["example/model"]}),
-            serde_json::json!({"model_backed": true, "models": [valid_ref.clone(), "example/model"]}),
-            serde_json::json!({"model_backed": true, "models": [{}]}),
-            serde_json::json!({"model_backed": true, "models": "example/model"}),
-            serde_json::json!({
-                "model_backed": true,
-                "models": [{
-                    "id": "fixture-model",
-                    "spdx_expression": "MIT",
-                    "attribution_required": true
-                }]
-            }),
-            serde_json::json!({
-                "model_backed": true,
-                "models": [{
-                    "id": "fixture-model",
-                    "spdx_expression": "MIT",
-                    "attribution_required": "yes",
-                    "huggingface_id": "example/model",
-                    "revision": "0123456789abcdef0123456789abcdef01234567"
-                }]
-            }),
-            serde_json::json!({
-                "model_backed": true,
-                "models": [{
-                    "id": "fixture-model",
-                    "spdx_expression": "MIT",
-                    "attribution_required": true,
-                    "source_url": "http://models.example.test/model"
-                }]
-            }),
-            serde_json::json!({
-                "model_backed": true,
-                "models": [{
-                    "id": "fixture-model",
-                    "spdx_expression": "MIT",
-                    "attribution_required": true,
-                    "huggingface_id": "example/model",
-                    "revision": "0123456789abcdef0123456789abcdef01234567",
-                    "copyright": 42
-                }]
-            }),
+    fn capability_publish_rejects_registry_inadmissible_ai_before_registry_writes() {
+        let mut moving_revision = pinned_model_ref();
+        moving_revision["revision"] = Value::from("main");
+        let mut no_rights = pinned_model_ref();
+        for field in [
+            "commercial_use",
+            "redistribution",
+            "derivatives",
+            "verification",
+        ] {
+            no_rights
+                .as_object_mut()
+                .expect("model ref object")
+                .remove(field);
+        }
+        let mut bad_spdx = pinned_model_ref();
+        bad_spdx["spdx_expression"] = Value::from("Apache2");
+        let cases = vec![
+            (
+                serde_json::json!({"model_backed": true, "models": [moving_revision]}),
+                "contract.model_rights_mutable_revision",
+            ),
+            (
+                serde_json::json!({"model_backed": true, "models": [no_rights]}),
+                "contract.invalid_model_rights",
+            ),
+            (
+                serde_json::json!({"model_backed": true, "models": [bad_spdx]}),
+                "contract.invalid_licensing_spdx",
+            ),
+            (
+                serde_json::json!({"model_backed": true, "models": ["example/model"]}),
+                "contract.ai_models_legacy_shape_on_new_contract",
+            ),
+            (
+                serde_json::json!({"model_backed": true}),
+                "contract.invalid_ai",
+            ),
+            (serde_json::json!("model"), "contract.invalid_ai"),
         ];
 
-        for ai in invalid_ai_values {
+        for (ai, registry_code) in cases {
             let fixture = capability_publish_fixture();
-            let mut contract: Value = serde_json::from_str(
-                &fs::read_to_string(&fixture.contract).expect("fixture contract should read"),
-            )
-            .expect("fixture contract should parse");
-            contract["ai"] = ai;
-            fs::write(
-                &fixture.contract,
-                serde_json::to_string_pretty(&contract).expect("fixture contract should serialize"),
-            )
-            .expect("fixture contract should write");
-
+            write_fixture_ai(&fixture, ai);
             let runner = RecordingPublishRunner::default();
             let output = capability_publish_at(&fixture.request(false), &runner)
                 .expect("invalid model metadata should be returned as JSON evidence");
@@ -9518,33 +9382,34 @@ mod tests {
                 json["errors"][0]["code"],
                 "capability_publish_model_attribution_invalid"
             );
+            let message = json["errors"][0]["message"].as_str().unwrap_or_default();
             assert!(
-                json["errors"][0]["message"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("Spec 001 FR-017 (Decision 124)")
+                message.contains(registry_code),
+                "{registry_code} missing from {message}"
             );
+            assert!(message.contains("registry Spec 001 FR-017, Spec 026"));
             assert!(runner.commands.borrow().is_empty());
             assert!(!fixture.registry_contract_path().exists());
         }
     }
 
+    /// Spec 056 v1.1.0 FR-017 / acceptance scenario 7: `"ai": null` is absent.
+    #[test]
+    fn capability_publish_treats_null_ai_as_absent() {
+        let fixture = capability_publish_fixture();
+        let contract = write_fixture_ai(&fixture, Value::Null);
+        assert!(validate_publish_ai_model_metadata(&contract).is_ok());
+        capability_publish_plan(&fixture.request(true), DEFAULT_REGISTRY_REPO)
+            .expect("a null ai object should plan like an absent one");
+    }
+
     #[test]
     fn capability_publish_allows_legacy_model_ids_only_for_non_model_backed_contracts() {
         let fixture = capability_publish_fixture();
-        let mut contract: Value = serde_json::from_str(
-            &fs::read_to_string(&fixture.contract).expect("fixture contract should read"),
-        )
-        .expect("fixture contract should parse");
-        contract["ai"] = serde_json::json!({
-            "model_backed": false,
-            "models": ["example/model"]
-        });
-        fs::write(
-            &fixture.contract,
-            serde_json::to_string_pretty(&contract).expect("fixture contract should serialize"),
-        )
-        .expect("fixture contract should write");
+        let contract = write_fixture_ai(
+            &fixture,
+            serde_json::json!({"model_backed": false, "models": ["example/model"]}),
+        );
 
         assert!(validate_publish_ai_model_metadata(&contract).is_ok());
         let plan = capability_publish_plan(&fixture.request(true), DEFAULT_REGISTRY_REPO)
@@ -9552,65 +9417,6 @@ mod tests {
         let published: Value =
             serde_json::from_str(&plan.contract_json).expect("planned contract should parse");
         assert_eq!(published["ai"], contract["ai"]);
-    }
-
-    #[test]
-    fn validate_publish_ai_model_metadata_rejects_malformed_model_refs() {
-        let missing_spdx = serde_json::json!({
-            "id": "fixture-model",
-            "attribution_required": true,
-            "huggingface_id": "example/model",
-            "revision": "0123456789abcdef0123456789abcdef01234567"
-        });
-        let blank_optional_pin = serde_json::json!({
-            "id": "fixture-model",
-            "spdx_expression": "MIT",
-            "attribution_required": true,
-            "huggingface_id": "example/model",
-            "revision": " "
-        });
-        let bad_optional_type = serde_json::json!({
-            "id": "fixture-model",
-            "spdx_expression": "MIT",
-            "attribution_required": true,
-            "source_url": "https://models.example.test/model",
-            "huggingface_id": 42
-        });
-        let cases = vec![
-            serde_json::json!({"ai": {"model_backed": false, "models": [" "]}}),
-            serde_json::json!({"ai": {"model_backed": false, "models": [42]}}),
-            serde_json::json!({"ai": {"model_backed": true, "models": [missing_spdx]}}),
-            serde_json::json!({"ai": {"model_backed": true, "models": [blank_optional_pin]}}),
-            serde_json::json!({"ai": {"model_backed": true, "models": [bad_optional_type]}}),
-            serde_json::json!({
-                "ai": {"model_backed": true, "models": [{
-                    "id": "fixture-model",
-                    "spdx_expression": "MIT",
-                    "attribution_required": true,
-                    "source_url": "https://user:secret@models.example.test/model"
-                }]}
-            }),
-        ];
-
-        for contract in cases {
-            let error = validate_publish_ai_model_metadata(&contract)
-                .expect_err("malformed model metadata must fail closed");
-            assert_eq!(error.0, "capability_publish_model_attribution_invalid");
-            assert!(error.1.contains("Spec 001 FR-017 (Decision 124)"));
-        }
-
-        assert!(
-            validate_publish_ai_model_metadata(&serde_json::json!({
-                "ai": {"model_backed": false}
-            }))
-            .is_ok()
-        );
-        assert!(
-            validate_publish_ai_model_metadata(&serde_json::json!({
-                "ai": {"model_backed": false, "models": []}
-            }))
-            .is_ok()
-        );
     }
 
     #[test]

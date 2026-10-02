@@ -1,0 +1,9 @@
+{
+  "source_repository": "traverse-framework/registry",
+  "source_path": "scripts/ci/fixtures/ai_admission_corpus.json",
+  "source_commit": "f5221c4316e4fb9d08f6b314ad61ce880ccba0bf",
+  "corpus_version": "1.0.0",
+  "sha256": "a44c001c39f6f51bb8bbc479c0a0e8c7e12d7beed675145a98c1935c27e61609",
+  "governing_spec": "056-capability-publish v1.1.0 FR-019 (Decision 109)",
+  "update": "Copy the file from a newer registry commit, then update source_commit, corpus_version and sha256 in a dedicated Traverse PR."
+}
