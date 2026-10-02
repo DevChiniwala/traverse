@@ -11,14 +11,20 @@
 //! rights drift) stay with registry CI (FR-015).
 //!
 //! Parity is proven by the registry-owned fixture corpus vendored under
-//! `tests/fixtures/registry-admission/` (FR-019). Each error carries the
+//! `registry-admission/` (FR-019). Each error carries the
 //! registry's own error code, so the corpus test compares code sets
 //! exactly. Behaviour follows Python's semantics where they differ from
 //! Rust's. For example, a JSON `null` reads as absent through `dict.get`,
 //! and `$` in a pin regex also matches before one trailing newline.
 
 use serde_json::{Map, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
+use std::sync::OnceLock;
+
+/// The registry's export of every license and exception name the pinned
+/// `license-expression` knows (keys and aliases). It is vendored and pinned
+/// next to the fixture corpus (`registry-admission/PIN.json`, Decision 109).
+const SPDX_SYMBOLS_JSON: &str = include_str!("../registry-admission/spdx_symbols.json");
 
 const MODEL_RIGHTS_FIELDS: [&str; 3] = ["commercial_use", "redistribution", "derivatives"];
 const RIGHTS_VALUES: [&str; 4] = ["allowed", "forbidden", "conditional", "unknown"];
@@ -580,7 +586,7 @@ fn is_registry_release_asset_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix(REGISTRY_RELEASE_PREFIX) else {
         return false;
     };
-    let rest = strip_one_trailing_newline(rest);
+    // `[^/]+$` also matches `\n`, so a trailing newline is part of the asset name.
     let mut segments = rest.split('/');
     matches!(
         (segments.next(), segments.next(), segments.next()),
@@ -639,12 +645,14 @@ enum SpdxToken<'a> {
 
 /// Registry `validate_spdx_expression`. It mirrors the pinned
 /// `license-expression` behaviour in strict mode with `validate=False`:
-/// - `AND`, `OR` and `WITH` are case-insensitive.
-/// - License and exception ids are matched case-insensitively against the
-///   SPDX list, deprecated ids included.
+/// - `AND`, `OR` and `WITH` are case-insensitive, and none may end the
+///   expression.
+/// - Ids resolve case-insensitively against the registry's exported symbol
+///   table, including aliases and multi-word aliases such as `GPL 2.0`.
+/// - An exception id is valid only on the right of `WITH`.
 /// - `+` is part of the identifier.
-/// - `LicenseRef-*`, `UNLICENSED` and `NONE` are accepted as unknown keys.
-/// - The right side of `WITH` must be a listed exception.
+/// - Unknown `LicenseRef-*`, `UNLICENSED` and `NONE` are accepted; any other
+///   unknown id is rejected.
 fn validate_spdx_expression(expression: &str, errors: &mut Errors) {
     match parse_spdx(expression) {
         Err(reason) => errors.fail(
@@ -663,20 +671,27 @@ fn validate_spdx_expression(expression: &str, errors: &mut Errors) {
 }
 
 fn tokenize_spdx(expression: &str) -> Result<Vec<SpdxToken<'_>>, String> {
-    let mut tokens = Vec::new();
+    // Pass 1: ordered word spans and parentheses.
+    let mut lexemes: Vec<Option<(usize, usize)>> = Vec::new();
+    let mut parens: Vec<SpdxToken<'_>> = Vec::new();
     let mut start = None;
     for (index, c) in expression.char_indices() {
-        let is_word = c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-' | '+');
-        if is_word {
+        if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-' | '+') {
             start.get_or_insert(index);
             continue;
         }
         if let Some(word_start) = start.take() {
-            tokens.push(word_token(&expression[word_start..index]));
+            lexemes.push(Some((word_start, index)));
         }
         match c {
-            '(' => tokens.push(SpdxToken::Open),
-            ')' => tokens.push(SpdxToken::Close),
+            '(' | ')' => {
+                lexemes.push(None);
+                parens.push(if c == '(' {
+                    SpdxToken::Open
+                } else {
+                    SpdxToken::Close
+                });
+            }
             c if c.is_whitespace() => {}
             other => {
                 return Err(format!(
@@ -686,9 +701,85 @@ fn tokenize_spdx(expression: &str) -> Result<Vec<SpdxToken<'_>>, String> {
         }
     }
     if let Some(word_start) = start {
-        tokens.push(word_token(&expression[word_start..]));
+        lexemes.push(Some((word_start, expression.len())));
+    }
+    // Pass 2: words separated only by whitespace merge into a known
+    // multi-word alias (e.g. `GPL 2.0`), as license-expression's tokenizer does.
+    let mut tokens = Vec::new();
+    let mut parens = parens.into_iter();
+    let mut index = 0;
+    while let Some(lexeme) = lexemes.get(index) {
+        index += 1;
+        let Some((word_start, mut word_end)) = *lexeme else {
+            tokens.extend(parens.next());
+            continue;
+        };
+        if let Some(Some((_, next_end))) = lexemes.get(index)
+            && spdx_symbols().is_known(&expression[word_start..*next_end])
+        {
+            word_end = *next_end;
+            index += 1;
+        }
+        tokens.push(word_token(&expression[word_start..word_end]));
     }
     Ok(tokens)
+}
+
+/// Lower-cased, whitespace-collapsed form used for symbol lookups.
+fn normalize_symbol(symbol: &str) -> String {
+    symbol
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+#[derive(Default)]
+struct SpdxSymbols {
+    licenses: HashSet<String>,
+    exceptions: HashSet<String>,
+}
+
+impl SpdxSymbols {
+    fn from_json(text: &str) -> Self {
+        let Ok(table) = serde_json::from_str::<Value>(text) else {
+            // Fail closed: with no known ids every expression is rejected.
+            return Self::default();
+        };
+        let names = |key: &str| -> HashSet<String> {
+            table[key]
+                .as_array()
+                .map(|names| {
+                    names
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(normalize_symbol)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Self {
+            licenses: names("licenses"),
+            exceptions: names("exceptions"),
+        }
+    }
+
+    fn is_license(&self, symbol: &str) -> bool {
+        self.licenses.contains(&normalize_symbol(symbol))
+    }
+
+    fn is_exception(&self, symbol: &str) -> bool {
+        self.exceptions.contains(&normalize_symbol(symbol))
+    }
+
+    fn is_known(&self, symbol: &str) -> bool {
+        self.is_license(symbol) || self.is_exception(symbol)
+    }
+}
+
+fn spdx_symbols() -> &'static SpdxSymbols {
+    static SYMBOLS: OnceLock<SpdxSymbols> = OnceLock::new();
+    SYMBOLS.get_or_init(|| SpdxSymbols::from_json(SPDX_SYMBOLS_JSON))
 }
 
 fn word_token(word: &str) -> SpdxToken<'_> {
@@ -769,7 +860,9 @@ impl<'a> SpdxParser<'_, 'a> {
                 if self.peek() == Some(SpdxToken::With) {
                     self.position += 1;
                     match self.peek() {
-                        Some(SpdxToken::Symbol(exception)) if is_listed_exception(exception) => {
+                        Some(SpdxToken::Symbol(exception))
+                            if spdx_symbols().is_exception(exception) =>
+                        {
                             self.position += 1;
                         }
                         _ => {
@@ -785,10 +878,10 @@ impl<'a> SpdxParser<'_, 'a> {
     }
 
     fn license_symbol(&mut self, symbol: &str) -> Result<(), String> {
-        if is_listed_license(symbol) {
+        if spdx_symbols().is_license(symbol) {
             return Ok(());
         }
-        if is_listed_exception(symbol) {
+        if spdx_symbols().is_exception(symbol) {
             return Err(format!(
                 "{symbol:?} is a license exception and is only valid after WITH"
             ));
@@ -800,18 +893,6 @@ impl<'a> SpdxParser<'_, 'a> {
     }
 }
 
-fn is_listed_license(symbol: &str) -> bool {
-    spdx::identifiers::LICENSES
-        .iter()
-        .any(|license| license.name.eq_ignore_ascii_case(symbol))
-}
-
-fn is_listed_exception(symbol: &str) -> bool {
-    spdx::identifiers::EXCEPTIONS
-        .iter()
-        .any(|exception| exception.name.eq_ignore_ascii_case(symbol))
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
@@ -821,29 +902,39 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
 
-    const CORPUS: &str =
-        include_str!("../tests/fixtures/registry-admission/ai_admission_corpus.json");
-    const PIN: &str = include_str!("../tests/fixtures/registry-admission/PIN.json");
+    const CORPUS: &str = include_str!("../registry-admission/ai_admission_corpus.json");
+    const PIN: &str = include_str!("../registry-admission/PIN.json");
 
     fn corpus() -> Value {
         serde_json::from_str(CORPUS).expect("vendored corpus must be JSON")
     }
 
+    fn sha256_hex(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .fold(String::new(), |mut hex, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            })
+    }
+
     #[test]
-    fn vendored_corpus_matches_its_pin() {
+    fn vendored_registry_files_match_their_pin() {
         let pin: Value = serde_json::from_str(PIN).expect("PIN.json must be JSON");
-        let digest = Sha256::digest(CORPUS.as_bytes());
-        let hex = digest.iter().fold(String::new(), |mut hex, byte| {
-            use std::fmt::Write as _;
-            let _ = write!(hex, "{byte:02x}");
-            hex
-        });
         assert_eq!(
-            pin["sha256"],
-            hex.as_str(),
+            pin["files"]["ai_admission_corpus.json"]["sha256"],
+            sha256_hex(CORPUS.as_bytes()).as_str(),
             "corpus bytes differ from PIN.json"
         );
+        assert_eq!(
+            pin["files"]["spdx_symbols.json"]["sha256"],
+            sha256_hex(super::SPDX_SYMBOLS_JSON.as_bytes()).as_str(),
+            "SPDX symbol table bytes differ from PIN.json"
+        );
         assert_eq!(pin["corpus_version"], corpus()["corpus_version"]);
+        let symbols = super::spdx_symbols();
+        assert!(symbols.licenses.len() > 2000 && symbols.exceptions.len() > 200);
     }
 
     /// Spec 056 v1.1.0 FR-019: agree with registry CI on every
@@ -911,6 +1002,9 @@ mod tests {
             "UNLICENSED",
             "MIT\tOR Apache-2.0",
             "BSD-3-clause",
+            "GPL 2.0",
+            "MIT OR gpl 2.0+",
+            "Apache-2.0 WITH GPL-3.0-with-GCC-exception",
         ] {
             assert_eq!(parse_spdx(accepted), Ok(Vec::new()), "{accepted}");
         }
@@ -929,6 +1023,9 @@ mod tests {
             "LLVM-exception",
             "MIT/Apache-2.0",
             "",
+            "MIT AND Apache-2.0 AND",
+            "eCos-2.0",
+            "MPL-2.0-no-copyleft-exception",
         ] {
             assert!(parse_spdx(rejected).is_err(), "{rejected}");
         }

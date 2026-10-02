@@ -6120,10 +6120,14 @@ registry-only field it carries, not just model attribution.
    - A CLI test must agree with every `contract_decidable` fixture.
    - The registry corpus lands first; the Traverse change follows and pins
      it.
-7. **SPDX is checked with the Rust `spdx` crate in strict mode.** The corpus
-   includes valid and invalid expressions, so any disagreement with CI's
-   pinned `license-expression` shows up as a failing fixture rather than as
-   silent drift.
+7. **SPDX is checked against the registry's exported symbol table.** The
+   registry exports every licence and exception name its pinned
+   `license-expression` knows (`spdx_symbols.json`), and Traverse vendors it
+   under the same pin as the corpus. The CLI parses SPDX grammar itself and
+   resolves ids only through that table, so licence-versus-exception
+   classification and aliases match CI exactly. The corpus includes SPDX
+   fixtures, so any disagreement shows up as a failing fixture rather than
+   as silent drift. (Amended 2026-10-02; see Approval.)
 8. **Landing.**
    - The work is added to `#1597` itself: maintainer edits are enabled, and
      the contributor's commit and credit are kept.
@@ -6170,3 +6174,16 @@ Approved by Enrico in `/brainstorm` (2026-10-01). Every recommended option
 was accepted, except the PR path: Enrico chose to have the fix and the
 missing Spec 026 scope implemented on `#1597`, instead of requesting
 changes from the contributor.
+
+Amended 2026-10-02 by Enrico ("fix now, registry first"). Rule 7 first said
+the CLI would use the Rust `spdx` crate in strict mode. A differential fuzz
+of the CLI port against registry CI showed why that couldn't work: the
+structural `ai` rules agreed on all 4,000 mutated objects, but SPDX
+disagreed on 457 of 7,082 expressions. `license-expression` bundles
+ScanCode's database, which classifies 243 names as exceptions, has a
+different licence list, knows multi-word aliases, and silently accepts a
+trailing `AND`/`OR`. Registry `#630` (registry decision-log entry 130)
+exports the symbol table and rejects dangling operators. The CLI now
+resolves ids only through that vendored table and drops the `spdx` crate.
+The fuzz rerun showed 0 disagreements across 27,263 cases.
+

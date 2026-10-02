@@ -1,0 +1,18 @@
+{
+  "source_repository": "traverse-framework/registry",
+  "source_commit": "4b48f527493953ee5ada9e5ea027db42cc95c57a",
+  "corpus_version": "1.1.0",
+  "license_expression_version": "30.4.4",
+  "files": {
+    "ai_admission_corpus.json": {
+      "source_path": "scripts/ci/fixtures/ai_admission_corpus.json",
+      "sha256": "2b845f6abcc4630278659d562ef9d2d0b51128277aceec9592fb0a5b87758edf"
+    },
+    "spdx_symbols.json": {
+      "source_path": "scripts/ci/fixtures/spdx_symbols.json",
+      "sha256": "87ffc06db1bf288365405b81af80b332a7d395258ae133a59d5e8e05eaf0268a"
+    }
+  },
+  "governing_spec": "056-capability-publish v1.1.0 FR-019 (Decision 109)",
+  "update": "Copy both files from a newer registry commit, then update source_commit, the versions and each sha256 in a dedicated Traverse PR."
+}

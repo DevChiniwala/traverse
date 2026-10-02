@@ -76,8 +76,11 @@ files to verify their digests, and matching `converted_sha256` against
 `model-weights.json`. Those stay with registry CI, and the CLI fetches
 nothing.
 
+SPDX ids resolve against the registry's exported `license-expression`
+symbol table, so licence and exception names match registry CI exactly.
+
 The CLI's rules are proven against the registry-owned fixture corpus vendored
-in `crates/traverse-cli/tests/fixtures/registry-admission/` (Spec 056 v1.1.0
+in `crates/traverse-cli/registry-admission/` (Spec 056 v1.1.0
 FR-019, Decision 109).
 
 ## Minimal Working Template
